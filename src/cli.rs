@@ -5,13 +5,21 @@ use bricklayers::brick;
 use bricklayers::slicer::WallOrder;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+/// What `--version` reports. The release workflow stamps the published GitHub
+/// tag in, so the version is whatever that release was called; nothing in the
+/// source tracks it, and a build from source has no release behind it.
+const VERSION: &str = match option_env!("BRICKLAYERS_VERSION") {
+    Some(tag) => tag,
+    None => "dev",
+};
+
 /// Post-process sliced G-code so layers interlock instead of stacking as flat
 /// sheets.
 ///
 /// Add the chosen sub-command to your slicer's post-processing scripts field;
 /// the slicer appends the G-code path automatically.
 #[derive(Debug, Parser)]
-#[command(name = "bricklayers", version, about, long_about = None)]
+#[command(name = "bricklayers", version = VERSION, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

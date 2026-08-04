@@ -226,6 +226,19 @@ fn the_wave_transform_is_gone() {
     assert!(!help.contains("wave"), "{help}");
 }
 
+/// The version comes from the tag the release workflow stamped in, so a build
+/// nobody released says "dev" rather than a number kept in the source.
+#[test]
+fn the_version_comes_from_the_release_tag() {
+    let expected = option_env!("BRICKLAYERS_VERSION").unwrap_or("dev");
+    let output = run(&["--version"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("bricklayers {expected}")
+    );
+}
+
 #[test]
 fn output_flag_leaves_the_input_alone() {
     let sandbox = Sandbox::new("output-flag");

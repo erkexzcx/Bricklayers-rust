@@ -1,0 +1,288 @@
+name: Publish Binary Release
+run-name: Publish binary release ${{ github.event.release.tag_name }}
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Vendor dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Vendor crate sources
+        run: |
+          cargo vendor --locked --versioned-dirs vendor > vendor-config.toml
+          tar -cf vendor.tar vendor vendor-config.toml
+
+      - name: Upload vendored dependencies
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-vendor
+          path: vendor.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  build-binaries:
+    name: Build ${{ matrix.os_name }} ${{ matrix.arch }} binary
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os_name: linux
+            arch: amd64
+            apt_packages: musl-tools
+            linker: musl-gcc
+            cargo_command: build
+            suffix: ''
+          - target: aarch64-unknown-linux-musl
+            os_name: linux
+            arch: arm64
+            apt_packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            cargo_command: build
+            suffix: ''
+          - target: x86_64-pc-windows-gnu
+            os_name: windows
+            arch: amd64
+            apt_packages: gcc-mingw-w64-x86-64
+            linker: x86_64-w64-mingw32-gcc
+            cargo_command: build
+            suffix: .exe
+          # No mingw for arm64 in apt, so this one goes through the MSVC toolchain that
+          # cargo-xwin downloads.
+          - target: aarch64-pc-windows-msvc
+            os_name: windows
+            arch: arm64
+            apt_packages: clang lld
+            linker: ''
+            cargo_command: xwin build
+            suffix: .exe
+          # Zig carries its own macOS libc stubs, so these need no Apple SDK and no Apple host.
+          - target: aarch64-apple-darwin
+            os_name: darwin
+            arch: arm64
+            apt_packages: ''
+            linker: ''
+            cargo_command: zigbuild
+            suffix: ''
+          - target: x86_64-apple-darwin
+            os_name: darwin
+            arch: amd64
+            apt_packages: ''
+            linker: ''
+            cargo_command: zigbuild
+            suffix: ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install cross linker
+        if: matrix.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ${APT_PACKAGES}
+
+      - name: Set up Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "${TARGET}"
+
+      # These must run before the vendored sources land, or cargo install would look for the
+      # helper in this project's vendor directory instead of crates.io.
+      - name: Install Zig and cargo-zigbuild
+        if: matrix.cargo_command == 'zigbuild'
+        run: |
+          pip install --break-system-packages ziglang
+          cargo install --locked cargo-zigbuild
+
+      - name: Install cargo-xwin
+        if: startsWith(matrix.cargo_command, 'xwin')
+        run: cargo install --locked cargo-xwin
+
+      - name: Download vendored dependencies
+        uses: actions/download-artifact@v8
+        with:
+          name: cargo-vendor
+
+      - name: Use vendored dependencies
+        run: |
+          tar -xf vendor.tar
+          mkdir -p .cargo
+          mv vendor-config.toml .cargo/config.toml
+
+      - name: Build binary
+        env:
+          TARGET: ${{ matrix.target }}
+          LINKER: ${{ matrix.linker }}
+          CARGO_COMMAND: ${{ matrix.cargo_command }}
+          # Accepts Microsoft's licence for the CRT and SDK headers cargo-xwin downloads.
+          XWIN_ACCEPT_LICENSE: '1'
+        run: |
+          # Every target is cross-compiled from x86_64, so rustc needs the matching linker.
+          if [ -n "${LINKER}" ]; then
+            export "CARGO_TARGET_$(echo "${TARGET}" | tr 'a-z-' 'A-Z_')_LINKER=${LINKER}"
+          fi
+          cargo ${CARGO_COMMAND} --release --locked --offline --target "${TARGET}"
+
+      - name: Name release asset
+        id: asset
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          TARGET: ${{ matrix.target }}
+          OS_NAME: ${{ matrix.os_name }}
+          ARCH: ${{ matrix.arch }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          # Assets are shipped uncompressed so deploy.sh can curl one straight onto disk.
+          asset_name="bricklayers_${TAG_NAME}_${OS_NAME}_${ARCH}${SUFFIX}"
+          mkdir -p dist
+          cp "target/${TARGET}/release/bricklayers${SUFFIX}" "dist/${asset_name}"
+          chmod 755 "dist/${asset_name}"
+          echo "asset_name=${asset_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-binary-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: dist/${{ steps.asset.outputs.asset_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload release asset
+        uses: actions/github-script@v9
+        env:
+          ASSET_NAME: ${{ steps.asset.outputs.asset_name }}
+          ASSET_PATH: dist/${{ steps.asset.outputs.asset_name }}
+          ASSET_CONTENT_TYPE: application/octet-stream
+        with:
+          retries: 3
+          script: |
+            const fs = require('fs')
+            const assetName = process.env.ASSET_NAME
+            const assetPath = process.env.ASSET_PATH
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const releaseId = context.payload.release.id
+
+            const existingAssets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner,
+              repo,
+              release_id: releaseId,
+              per_page: 100,
+            })
+            const existingAsset = existingAssets.find((asset) => asset.name === assetName)
+
+            if (existingAsset) {
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: existingAsset.id,
+              })
+            }
+
+            const data = fs.readFileSync(assetPath)
+
+            await github.rest.repos.uploadReleaseAsset({
+              owner,
+              repo,
+              release_id: releaseId,
+              name: assetName,
+              headers: {
+                'content-type': process.env.ASSET_CONTENT_TYPE,
+                'content-length': data.length,
+              },
+              data,
+            })
+
+  checksums:
+    name: Publish checksums
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-binary-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        id: checksums
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          checksum_name="bricklayers_${TAG_NAME}_SHA256SUMS.txt"
+          (
+            cd dist
+            sha256sum * > "${checksum_name}"
+          )
+          echo "checksum_name=${checksum_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload checksums to release
+        uses: actions/github-script@v9
+        env:
+          ASSET_NAME: ${{ steps.checksums.outputs.checksum_name }}
+          ASSET_PATH: dist/${{ steps.checksums.outputs.checksum_name }}
+          ASSET_CONTENT_TYPE: text/plain
+        with:
+          retries: 3
+          script: |
+            const fs = require('fs')
+            const assetName = process.env.ASSET_NAME
+            const assetPath = process.env.ASSET_PATH
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const releaseId = context.payload.release.id
+
+            const existingAssets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner,
+              repo,
+              release_id: releaseId,
+              per_page: 100,
+            })
+            const existingAsset = existingAssets.find((asset) => asset.name === assetName)
+
+            if (existingAsset) {
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: existingAsset.id,
+              })
+            }
+
+            const data = fs.readFileSync(assetPath)
+
+            await github.rest.repos.uploadReleaseAsset({
+              owner,
+              repo,
+              release_id: releaseId,
+              name: assetName,
+              headers: {
+                'content-type': process.env.ASSET_CONTENT_TYPE,
+                'content-length': data.length,
+              },
+              data,
+            })

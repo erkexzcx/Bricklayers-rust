@@ -1,0 +1,11 @@
+mini_cube_ps2.8.1.bgcode
+mini_cube_b.bgcode
+
+Binary G-code test files taken from Prusa Research's libbgcode, at
+https://github.com/prusa3d/libbgcode (tests/data), which is licensed under the
+GNU Affero General Public License v3.0.
+
+They are kept here so the decoder can be checked against files produced by the
+reference implementation rather than by this project. The matching ASCII files
+from that repository are not included; the expected decoder output is pinned as
+a length and CRC32 in tests/binary_gcode.rs instead.

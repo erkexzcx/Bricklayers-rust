@@ -89,6 +89,6 @@ scripts, Orca/Bambu Studio: Others -> Post-processing Scripts:
 
     "$binary" brick --extrusion-multiplier 1.05
 
-Keep the quotes. The slicer appends the G-code path itself. Use three walls or more, or there
-is nothing for a raised loop to bond to.
+Keep the quotes. The slicer appends the G-code path itself. Bricking needs two walls or more;
+three or more interlocks twice as much.
 "@

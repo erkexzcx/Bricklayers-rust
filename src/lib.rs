@@ -91,15 +91,6 @@ impl Source {
         }
     }
 
-    /// First layer height the file states about itself, from a binary
-    /// container's metadata. A plain file's comment is left to the survey.
-    pub fn first_layer_height(&self) -> Option<f64> {
-        match &self.kind {
-            Kind::Text => None,
-            Kind::Binary { container, .. } => container.first_layer_height,
-        }
-    }
-
     /// A reader positioned at the start. Each call is an independent pass.
     pub fn reader(&self) -> Result<Reader> {
         let file = File::open(&self.path).map_err(|s| Error::io(&self.path, s))?;

@@ -21,9 +21,6 @@ pub enum WallOrder {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub layer_height: Option<f64>,
-    /// Slicers print the first layer thicker than the rest by default, so the
-    /// bricking of that layer has a different gap to fill.
-    pub first_layer_height: Option<f64>,
     pub wall_order: Option<WallOrder>,
     /// Walls per region, external one included.
     pub walls: Option<u32>,
@@ -54,9 +51,6 @@ impl Settings {
 
         Self {
             layer_height: get(&["layer_height"])
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|height| height.is_finite() && *height > 0.0),
-            first_layer_height: get(&["first_layer_height", "initial_layer_print_height"])
                 .and_then(|value| value.parse::<f64>().ok())
                 .filter(|height| height.is_finite() && *height > 0.0),
             wall_order: get(&["external_perimeters_first", "wall_sequence"])
@@ -127,7 +121,6 @@ mod tests {
     fn reads_prusaslicer_settings() {
         let settings = read(&[
             ("SLIC3R_LAYER_HEIGHT", "0.25"),
-            ("SLIC3R_FIRST_LAYER_HEIGHT", "0.3"),
             ("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1"),
             ("SLIC3R_PERIMETERS", "3"),
             ("SLIC3R_SPIRAL_VASE", "0"),
@@ -135,7 +128,6 @@ mod tests {
             ("SLIC3R_PP_OUTPUT_NAME", "/media/sd/part.gcode"),
         ]);
         assert_eq!(settings.layer_height, Some(0.25));
-        assert_eq!(settings.first_layer_height, Some(0.3));
         assert_eq!(settings.wall_order, Some(WallOrder::ExternalFirst));
         assert_eq!(settings.walls, Some(3));
         assert_eq!(settings.spiral_vase, Some(false));
@@ -150,14 +142,12 @@ mod tests {
     fn reads_orca_and_bambu_settings() {
         let settings = read(&[
             ("SLIC3R_LAYER_HEIGHT", "0.16"),
-            ("SLIC3R_INITIAL_LAYER_PRINT_HEIGHT", "0.2"),
             ("SLIC3R_WALL_SEQUENCE", "inner wall/outer wall"),
             ("SLIC3R_WALL_LOOPS", "2"),
             ("SLIC3R_SPIRAL_MODE", "1"),
             ("SLIC3R_ENABLE_ARC_FITTING", "1"),
         ]);
         assert_eq!(settings.layer_height, Some(0.16));
-        assert_eq!(settings.first_layer_height, Some(0.2));
         assert_eq!(settings.wall_order, Some(WallOrder::InternalFirst));
         assert_eq!(settings.walls, Some(2));
         assert_eq!(settings.spiral_vase, Some(true));
@@ -193,10 +183,6 @@ mod tests {
         assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "-0.2")]).layer_height, None);
         assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "nan")]).layer_height, None);
         assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "auto")]).layer_height, None);
-        assert_eq!(
-            read(&[("SLIC3R_FIRST_LAYER_HEIGHT", "0")]).first_layer_height,
-            None
-        );
     }
 
     #[test]

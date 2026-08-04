@@ -38,6 +38,47 @@ between the two paths:
 Bimodal in every file. water_test sits higher because its extrusion width is
 1.26 mm.
 
+## The bed layer, and why a column climbs (2026-08-04)
+
+Reported as "the letters under a Benchy fill in". Measured on
+`benchy-maxwalls.gcode` (OrcaSlicer 2.4.2, 0.2/0.2, 240 layers).
+
+The old rule raised the bed layer's internal loops by the full shift and
+metered them at `(first_layer_height + shift) / first_layer_height` = 1.5.
+
+| | before | after |
+|---|---|---|
+| layer 0 internal perimeter filament | 38.96 → 47.63 mm (+22.3%) | 38.96 mm (untouched) |
+| layer 0 moves at 1.5× | 245 | 0 |
+| highest factor anywhere, default settings | 1.5 | 1.25 |
+| layer 0 vs the input | 8672 changed E words | **byte-identical** |
+| raised loops | 1976 | 1958 |
+| parity inversions | 22 | 21 |
+| invariant (external perimeters raised) | 0 of 21832 | 0 of 21832 |
+
+Why it showed up on the letters and not elsewhere:
+
+- **The nameplate recess is exactly one layer deep.** 16 wall loops under 3 mm
+  across sit inside the plate on layer 0 and **zero** on layer 1. So the whole
+  of the visible text is formed by the layer that was being over-extruded.
+- 12 of those loops were raised and given 1.5× flow, the smallest being
+  0.32 × 0.57 mm with a 1.39 mm path — a letter counter. They carried only
+  13.6% of layer 0's raised path, though; the full-width wall running along the
+  letters carried the rest, so a "don't over-extrude thin beads" rule would not
+  have fixed it.
+- The 1.5× was arithmetically exact and rested on a false premise: that the
+  bead becomes `first_layer_height + shift` tall. At 0.2 + 0.1 the nozzle sits
+  0.3 above the plate with a 0.4 orifice, so it never touches the bead. The
+  surplus widens it instead — 0.41 mm to 0.61 mm if the height stays at 0.2.
+
+Not a filament-accounting bug: retract/prime pairs stayed balanced through the
+change on four real files (benchy, orig-maxwalls, orig-2walls, 2dragons-2walls;
+50k cycles, zero net drift), and geometry is move-for-move identical.
+
+Sequential printing restarts the ramp per object, confirmed on
+`2dragons-2walls.gcode`: layers 0 and 109 are entirely 1.0×, layers 1–2 and
+110–111 are 1.25×, everything else 1.0×.
+
 The same pairs measured by distance from one loop's end to the next one's
 start — the signal that looks equivalent and is not:
 

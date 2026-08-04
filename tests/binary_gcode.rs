@@ -97,13 +97,12 @@ fn brickable_gcode(layers: usize) -> String {
 }
 
 /// Values taken from output verified line by line against the ASCII G-code
-/// libbgcode's own converter produces for these files. The ten-block file is
-/// sliced with a first layer thicker than the rest, which is the default.
+/// libbgcode's own converter produces for these files.
 #[test]
 fn decodes_real_prusaslicer_files() {
-    for (label, bytes, size, checksum, height, first) in [
-        ("single block", SINGLE, 53_301, 0x6A01_FC76, 0.2, 0.2),
-        ("ten blocks", MULTI, 621_913, 0xA1DD_ECAF, 0.15, 0.2),
+    for (label, bytes, size, checksum, height) in [
+        ("single block", SINGLE, 53_301, 0x6A01_FC76, 0.2),
+        ("ten blocks", MULTI, 621_913, 0xA1DD_ECAF, 0.15),
     ] {
         assert!(bgcode::is_binary(bytes), "{label}");
         let (container, gcode) = bgcode::parse(bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -111,7 +110,6 @@ fn decodes_real_prusaslicer_files() {
         assert_eq!(gcode.len(), size, "{label}");
         assert_eq!(crc32fast::hash(gcode.as_bytes()), checksum, "{label}");
         assert_eq!(container.layer_height, Some(height), "{label}");
-        assert_eq!(container.first_layer_height, Some(first), "{label}");
         assert!(gcode.contains(";TYPE:Perimeter\n"), "{label}");
         assert!(gcode.contains(";TYPE:External perimeter\n"), "{label}");
     }

@@ -43,15 +43,22 @@ Four consequences that are easy to get backwards:
    carry roughly a third of a part's filament (30.5% on a 240-layer Benchy), so
    `1.05` adds about 1.5% to its mass; `--verbose` prints the exact figure per
    file.
-3. **First layer**: a raised loop spans from the bed to the shifted nozzle, so
-   it needs `(first_layer_height + shift) / first_layer_height`. That is `1.5`
-   only when the first layer equals the layer height, which is not the default
-   in any slicer.
-4. **Last layer**: `capping()` keeps it flat, but the loop below it left a gap
-   of `layer_height - shift`, so it is metered at `0.5`. The layer this applies
-   to is the last one holding an *internal perimeter*, **not** the last layer of
-   the file — see the gotcha below, where testing the layer count meant capping
-   never fired at all.
+3. **The bed layer is never raised, and a column climbs over the two layers
+   above it.** Displacing a column upwards opens a half-layer void under its
+   bottom bead that has to be extruded once, whichever layer starts it. Asking
+   one bead for all of it leaves the nozzle half a layer clear of the surface
+   it lays against, so it presses nothing and the surplus spreads sideways —
+   on a Benchy that filled in the bottom nameplate, which is exactly one layer
+   deep. `RAMP` (2) spreads it: no bead spans more than a quarter of a layer
+   beyond what the slicer metered it for, and the layer on the plate comes
+   through byte for byte.
+4. **One formula covers all of it.** `extrusion_factor` is
+   `(layer_height + rise(k) - rise(k-1)) / layer_height`, where `rise` is the
+   column's offset `k` layers into the object. It falls out at 1.0 on the bed
+   (nothing has risen yet), 1.25 on each climbing layer, 1.0 once the column is
+   up — which is where `extrusion_multiplier` applies instead — and 0.5 where
+   `capping()` forces the offset back to zero. A column capped before it
+   finished climbing gives back only what it took, e.g. 0.75.
 
 ## Contour grouping — the hard part
 
@@ -184,6 +191,10 @@ Each of these cost a wrong answer or a shipped bug.
 - **Single-layer synthetic fixtures are invalid.** Layer 0 is also the last
   layer, so `capping()` suppresses the raise and every result is misleading.
   Two bad conclusions came from one such fixture.
+- **A fixture needs five layers, not two.** The bed layer is never raised and
+  the two above it are climbing, so a wall has to sit on layer 3 or higher
+  before it sees the steady-state flow. `middle_layer()` builds that; anything
+  hand-rolled shallower measures a climb and reads as a bug in the multiplier.
 - **A fixture whose wall sits on the file's last layer is invalid too**, and it
   hid a real bug for months. `capping()` used to test the layer count, and on
   six real Orca slices the last layer holding an internal perimeter is *never*

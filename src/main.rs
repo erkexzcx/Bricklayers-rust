@@ -95,7 +95,7 @@ fn repeated(command: &Command, survey: &Survey) -> Option<&'static str> {
     }
 }
 
-/// Fills in what the command line left out: both layer heights, and which end
+/// Fills in what the command line left out: the layer height, and which end
 /// of a wall the loop numbering starts from.
 fn resolve(
     mut config: brick::Config,
@@ -108,11 +108,6 @@ fn resolve(
         config.layer_height,
         slicer.layer_height,
         source.layer_height(),
-    );
-    config.first_layer_height = detected(
-        config.first_layer_height,
-        slicer.first_layer_height,
-        source.first_layer_height(),
     );
     // The flag wins outright rather than only being able to turn the order on:
     // detection reads slicer prose, so it can be wrong in either direction and

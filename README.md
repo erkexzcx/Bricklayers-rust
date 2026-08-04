@@ -39,14 +39,19 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
 - 🎛️ **Every slicer, one code path** — PrusaSlicer, SuperSlicer, OrcaSlicer, Bambu Studio and
   Cura region markers are all recognised by one classifier. No slicer detection, no flags.
   Tested mostly against OrcaSlicer, though — [see below](#-slicer-support).
-- 🔎 **Reads your slicer's settings** — layer height, first layer height, wall order and wall
+- 🔎 **Reads your slicer's settings** — layer height, wall order and wall
   count come from the environment your slicer exports, so `--layer-height` is never needed,
   and settings that quietly defeat the transform (spiral vase, too few walls) get a warning.
   Bambu's renamed spellings are accepted too.
+- 🧱 **The layer on the build plate is never touched** — a bead there is pressed against the
+  plate rather than against a layer, so raising it presses nothing and the extra flow spreads
+  sideways into whatever detail is beside it. A column climbs to its offset over the two
+  layers above the bed instead, which costs the same filament and asks no bead to span more
+  than a quarter of a layer beyond what your slicer metered it for.
 - �️ **Printing objects one at a time is understood** — a file sliced to complete each
   object before starting the next holds several first and last layers, and each one is
-  metered as such: bed layers get the flow their raised bead needs, object tops are left
-  flat.
+  treated as such: every object's bed layer is left alone and its column climbs from there,
+  and every object's top is left flat.
 - �🗜️ **Binary G-code just works** — `.bgcode` is read and written natively, no conversion step.
   Thumbnails and slicer config are copied byte for byte and the file keeps the compression it
   arrived with.
@@ -115,6 +120,11 @@ bricklayers brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode 
   they are all treated as external. Ground truth from a slice with overhang detection turned
   off says 12% of them were really inner wall, which works out at 0.009% of the print. Turning
   detection off changes the result by 46 loops in 15266. Worth knowing, not worth chasing.
+- **A wall only two or three layers tall pays for a stagger it never gets.** Starting a raised
+  column costs half a layer of extra filament, spread over the two layers above the bed. A
+  column that tall is all climb and no column, so it carries the cost with nothing above it to
+  bond to. Embossed and engraved detail on a flat face is the usual case. Skipping those needs
+  per-contour lookahead across layers, which the two-pass streaming design does not have.
 - **Variable / adaptive layer height gets the wrong raise.** The shift is half of *one* layer
   height for the whole file, so any layer thinner or thicker than the commonest one is
   staggered by the wrong amount.
@@ -254,8 +264,8 @@ wall, or region markers your slicer spells in a way that is not recognised.
 
 **No environment variables needed.** Slicers write their settings into the G-code as comments
 (`; layer_height = 0.2`, `; wall_sequence = inner wall/outer wall`), so a file exported by any
-mainstream slicer carries everything the transform needs — both heights and the wall order are
-read from there. Use `--layer-height`, `--first-layer-height` and `--wall-order` if a file has
+mainstream slicer carries everything the transform needs — the layer height and the wall order
+are read from there. Use `--layer-height` and `--wall-order` if a file has
 no settings block at all, or if what it says is read wrongly.
 
 ### `brick`
@@ -269,7 +279,6 @@ bricklayers brick [OPTIONS] <GCODE>
 | `--extrusion-multiplier <FACTOR>` | `1.0` | extra flow for raised loops, `1.0` to `1.3` |
 | `--reorder-loops` | off | print a layer's unraised loops first, so the nozzle changes height once per layer instead of once per loop — trades ~110 s of Z moves for ~19 m more travel |
 | `--layer-height <MM>` | auto | override detection |
-| `--first-layer-height <MM>` | auto | override detection |
 | `--wall-order <ORDER>` | `auto` | `auto`, `external-first` or `internal-first` — override the wall order read from the file |
 
 **About `--wall-order`.** Not a preference: it states which order your slicer already prints a
@@ -307,11 +316,11 @@ wall on *both* sides of it, which is the strongest keying available. Only a sing
 has nothing behind the visible wall to raise, and `brick` says so.
 
 External perimeters and the top layer are never touched, so the visible surface is unchanged.
-The first layer is metered against its own (usually thicker) height rather than the layer
-height. Loops are grouped into walls geometrically, by which loops run beside each other, and
-numbering starts at the loop against the external perimeter — a wall gains and loses loops at
-the hidden end, so numbering from there would invert the stagger every time the count changes.
-Either wall order works, and arc fitting is fine here.
+So is the layer laid on the build plate: the column climbs to its offset over the two layers
+above it instead. Loops are grouped into walls geometrically, by which loops run beside each
+other, and numbering starts at the loop against the external perimeter — a wall gains and loses
+loops at the hidden end, so numbering from there would invert the stagger every time the count
+changes. Either wall order works, and arc fitting is fine here.
 
 ### Shared
 

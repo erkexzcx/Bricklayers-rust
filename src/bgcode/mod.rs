@@ -42,14 +42,12 @@ pub struct Container {
     /// Layer height from the file's metadata, which plain G-code carries as a
     /// comment but binary G-code keeps out of the G-code stream.
     pub layer_height: Option<f64>,
-    /// First layer height from the same metadata.
-    pub first_layer_height: Option<f64>,
 }
 
 impl Container {
     /// Walks a container's block chain, keeping only what a rewrite has to put
-    /// back: the blocks that are not G-code, byte for byte, and the two heights
-    /// a binary file states outside its G-code stream.
+    /// back: the blocks that are not G-code, byte for byte, and the layer
+    /// height a binary file states outside its G-code stream.
     ///
     /// G-code payloads are stepped over rather than unpacked, so this costs a
     /// walk over the block headers and no memory that grows with the print.
@@ -68,7 +66,6 @@ impl Container {
         let mut block = Vec::new();
         let mut compression = Compression::Heatshrink12;
         let mut layer_height = None;
-        let mut first_layer_height = None;
 
         while !ended(&mut input)? {
             let start = at;
@@ -93,16 +90,14 @@ impl Container {
             at += rest as u64;
             verify(&block, checksums, start)?;
 
-            if (layer_height.is_none() || first_layer_height.is_none())
+            if layer_height.is_none()
                 && let Ok(ini) = decompress(
                     payload(&block, &header, trailer),
                     header.packing,
                     header.uncompressed,
                 )
             {
-                layer_height = layer_height.or_else(|| setting(&ini, "layer_height"));
-                first_layer_height =
-                    first_layer_height.or_else(|| setting(&ini, "first_layer_height"));
+                layer_height = setting(&ini, "layer_height");
             }
             prelude.extend_from_slice(&block);
         }
@@ -113,7 +108,6 @@ impl Container {
             prelude,
             compression,
             layer_height,
-            first_layer_height,
         })
     }
 
@@ -557,7 +551,6 @@ mod tests {
             prelude: Vec::new(),
             compression: Compression::Heatshrink12,
             layer_height: None,
-            first_layer_height: None,
         }
     }
 
@@ -819,7 +812,6 @@ mod tests {
 
         let container = Container::read(Cursor::new(&bytes[..])).expect("walk the chain");
         assert_eq!(container.layer_height, Some(0.25));
-        assert_eq!(container.first_layer_height, Some(0.3));
         assert_eq!(container.prelude, trailing, "kept byte for byte");
         assert_eq!(parse(&bytes).expect("decode").1, "G1 X1 Y1 E1\n");
     }

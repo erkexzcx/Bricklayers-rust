@@ -36,14 +36,26 @@ const MAX_LOOP_GAP: f64 = 2.0;
 /// which is what a wall does wherever it widens.
 const PROBES: usize = 16;
 
+/// Layers a raised column takes to climb to its full offset.
+///
+/// Displacing a column upwards opens a half-layer void beneath it that has to
+/// be extruded once, and the bead carrying it spans its own layer plus the
+/// whole climb. Asking one bead for all of it leaves the nozzle half a layer
+/// clear of the surface it is laying against, so it presses nothing and the
+/// extra flow spreads sideways instead of building height. Climbing costs the
+/// same filament and asks no bead to span more than a quarter of a layer
+/// beyond what the slicer metered it for.
+///
+/// The climb starts above the bed: a layer laid on the build plate has no seam
+/// under it to stagger, cannot be pressed against a surface that is not a
+/// layer, and is the face of the part that shows. On a Benchy the whole of the
+/// bottom nameplate is one layer deep, and raising it filled the letters in.
+const RAMP: usize = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// Layer height in mm. Detected from the file when `None`.
     pub layer_height: Option<f64>,
-    /// Height of the first layer in mm, which slicers commonly print thicker
-    /// than the rest. Falls back to the layer height when neither the file nor
-    /// the slicer says.
-    pub first_layer_height: Option<f64>,
     /// Extra extrusion for raised loops on middle layers.
     ///
     /// Volume alone says 1.0, and that is the default: a raised column stacks
@@ -69,7 +81,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             layer_height: None,
-            first_layer_height: None,
             extrusion_multiplier: 1.0,
             external_perimeters_first: false,
             reorder_loops: false,
@@ -195,9 +206,6 @@ struct Pass<'a, W: Write> {
     object_tops: Vec<usize>,
     layer_markers: bool,
     shift: f64,
-    /// Height of the first layer, which the raised loops of that layer have to
-    /// span from the bed rather than from the layer below.
-    first_layer_height: f64,
     out: W,
     extruder: Extruder,
     feature: Feature,
@@ -238,11 +246,6 @@ impl<'a, W: Write> Pass<'a, W> {
             object_tops: survey.object_tops.clone(),
             layer_markers: survey.layer_markers,
             shift: layer_height / 2.0,
-            first_layer_height: config
-                .first_layer_height
-                .or(survey.first_layer_height)
-                .filter(is_a_height)
-                .unwrap_or(layer_height),
             out,
             extruder: Extruder::new(),
             feature: Feature::Other,
@@ -419,16 +422,12 @@ impl<'a, W: Write> Pass<'a, W> {
             // parity fell: raising it would stand a bead half a layer proud of
             // the surface beside it, over a gap the layer below already half
             // filled. `extrusion_factor` meters that half gap.
-            let raise = current.raised && !self.capping();
+            let offset = if current.raised { self.offset() } else { 0.0 };
+            let raise = offset > 0.0;
             // After the lead, so a slicer's own Z-hop restore cannot undo it.
-            let target = if raise {
-                self.layer_z + self.shift
-            } else {
-                self.layer_z
-            };
-            self.move_z(target, raise)?;
+            self.move_z(self.layer_z + offset, raise)?;
             let factor = self.extrusion_factor(current.raised);
-            if current.raised {
+            if raise {
                 self.meter(current.body, end, factor);
             }
             for at in current.body..end {
@@ -636,29 +635,66 @@ impl<'a, W: Write> Pass<'a, W> {
         self.out.write_all(b"\n")
     }
 
-    /// Raised loops need more filament on the first layer of an object, where
-    /// their bead has to reach all the way down to the bed, and less on its
-    /// last, where the raised loop below has already filled all but half of
-    /// the gap.
+    /// Flow a loop's bead needs, as a multiple of what the slicer metered it
+    /// for.
+    ///
+    /// A raised bead spans from the top of whatever its own column left on the
+    /// layer below up to the nozzle, so the factor is that span over the
+    /// layer's own height. It falls out at 1.0 wherever the column is neither
+    /// climbing nor being capped, and that is the only place
+    /// [`Config::extrusion_multiplier`] has anything to compensate for.
     fn extrusion_factor(&self, raised: bool) -> f64 {
         if !raised {
-            1.0
-        } else if self.opening() {
-            // The slicer metered this bead for the first layer's height; raised,
-            // it spans that plus the shift. Assuming the two heights are equal
-            // is what makes a thick first layer come out starved.
-            (self.first_layer_height + self.shift) / self.first_layer_height
-        } else if self.capping() {
-            0.5
+            return 1.0;
+        }
+        if self.steady() {
+            return self.config.extrusion_multiplier;
+        }
+        let height = self.shift * 2.0;
+        (height + self.offset() - self.rise_below()) / height
+    }
+
+    /// How far above the layer plane a raised column stands `steps` layers
+    /// into the object it belongs to.
+    fn rise_at(&self, steps: usize) -> f64 {
+        self.shift * steps.min(RAMP) as f64 / RAMP as f64
+    }
+
+    /// The offset this layer's raised loops take.
+    fn offset(&self) -> f64 {
+        if self.capping() {
+            0.0
         } else {
-            self.config.extrusion_multiplier
+            self.rise_at(self.steps())
         }
     }
 
-    /// True on a layer laid straight onto the bed, which is the first of the
-    /// print and the first of every later object a sequential file builds.
-    fn opening(&self) -> bool {
-        self.object_starts.contains(&self.layer)
+    /// The offset the same column was left standing at on the layer below.
+    fn rise_below(&self) -> f64 {
+        match self.steps() {
+            0 => 0.0,
+            steps => self.rise_at(steps - 1),
+        }
+    }
+
+    /// Layers printed since this object's first. A file that completes objects
+    /// one at a time builds each from the bed up, so it has several.
+    fn steps(&self) -> usize {
+        let start = self
+            .object_starts
+            .iter()
+            .rev()
+            .find(|&&start| start <= self.layer)
+            .copied()
+            .unwrap_or(0);
+        self.layer - start
+    }
+
+    /// True where a raised column is neither climbing nor being capped, which
+    /// is the only place a bead spans exactly one layer.
+    fn steady(&self) -> bool {
+        let offset = self.offset();
+        offset > 0.0 && offset == self.rise_below()
     }
 
     /// True on a layer that tops an object's walls, which has nothing above it
@@ -672,12 +708,6 @@ impl<'a, W: Write> Pass<'a, W> {
         self.object_tops.contains(&self.layer)
     }
 
-    /// True away from the two ends of a raised column, which are the layers
-    /// where a derived factor rather than the multiplier sets the flow.
-    fn middle_layer(&self) -> bool {
-        !self.opening() && !self.capping()
-    }
-
     /// Books a raised loop's filament, and the share of it the multiplier
     /// added, so `--verbose` can price the setting against the whole part.
     fn meter(&mut self, body: usize, end: usize, factor: f64) {
@@ -687,7 +717,7 @@ impl<'a, W: Write> Pass<'a, W> {
             .filter(|delta| *delta > 0.0)
             .sum();
         self.raised_filament += stock * factor;
-        if self.middle_layer() {
+        if self.steady() {
             self.multiplier_filament += stock * (factor - 1.0);
         }
     }
@@ -730,19 +760,23 @@ mod tests {
         format!("; layer_height = 0.2\nM83\n{body}")
     }
 
-    /// A file whose middle layer carries `body`, so neither the first-layer nor
-    /// the last-layer extrusion factor applies.
+    /// A file whose middle layer carries `body`, so neither the layers a
+    /// column climbs over nor the one that caps it applies.
     ///
     /// A wall carries on above it, as it does in a real file. Without that the
     /// body would itself be the last layer holding a wall, which is what caps
     /// one, and every test built on this would measure a capped layer. Its
-    /// loop is left untagged so it stays out of [`loop_states`].
+    /// loop is left untagged so it stays out of [`loop_states`]. The empty
+    /// layers below it put the body clear of the [`RAMP`], where a raised
+    /// bead spans exactly one layer.
     fn middle_layer(body: &str) -> String {
         relative(&format!(
-            "{}{}{body}{}{}",
+            "{}{}{}{}{body}{}{}",
             layer(0.2),
             layer(0.4),
             layer(0.6),
+            layer(0.8),
+            layer(1.0),
             ";TYPE:Perimeter\n\
              G1 X0 Y0 F9000\n\
              G1 X10 Y0 E0.5\n\
@@ -811,11 +845,11 @@ mod tests {
         let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
         let out = run(&source, &Config::default());
         assert!(
-            out.contains("G1 Z0.500 F600 ; bricklayers brick raised"),
+            out.contains("G1 Z0.900 F600 ; bricklayers brick raised"),
             "{out}"
         );
         assert!(
-            out.contains("G1 Z0.400 F600 ; bricklayers brick reset"),
+            out.contains("G1 Z0.800 F600 ; bricklayers brick reset"),
             "{out}"
         );
     }
@@ -841,7 +875,7 @@ mod tests {
         );
         let out = run(&source, &Config::default());
         assert!(
-            out.contains("G1 Z0.500 F600 ; bricklayers brick raised"),
+            out.contains("G1 Z0.900 F600 ; bricklayers brick raised"),
             "{out}"
         );
         assert!(out.contains("G1 F1800 ; bricklayers brick resume"), "{out}");
@@ -852,13 +886,17 @@ mod tests {
         let source = relative(&format!(
             ";LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.2 F9000\n{}\
              ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.4 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Solid infill\nG1 X0 Y0 Z0.6 F9000\nG1 X10 Y0 E0.5\n",
+             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.6 F9000\n{}\
+             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.8 F9000\n{}\
+             ;LAYER_CHANGE\n;TYPE:Solid infill\nG1 X0 Y0 Z1.0 F9000\nG1 X10 Y0 E0.5\n",
             wall(2, "loop"),
+            wall(2, "second"),
+            wall(2, "third"),
             wall(2, "above")
         ));
         let out = run(&source, &Config::default());
         assert!(
-            out.contains("G1 Z0.300 F720 ; bricklayers brick raised"),
+            out.contains("G1 Z0.700 F720 ; bricklayers brick raised"),
             "{out}"
         );
     }
@@ -868,10 +906,11 @@ mod tests {
         // Raising here would stand a bead half a layer proud of the top
         // surface beside it, and meter it for half a gap that is a whole one.
         let source = relative(&format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             layer(0.2),
             layer(0.4),
             layer(0.6),
+            layer(0.8),
             format_args!(";TYPE:Perimeter\n{}", wall(2, "loop")),
             ";TYPE:Top solid infill\nG1 X40 Y0 E0.5\n"
         ));
@@ -893,12 +932,17 @@ mod tests {
         // slices: one to five layers below, so testing the layer count capped
         // nothing at all and left every part's topmost wall standing proud.
         let source = relative(&format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             layer(0.2),
             layer(0.4),
-            format_args!(";TYPE:Perimeter\n{}", wall(2, "loop")),
             layer(0.6),
-            ";TYPE:Top solid infill\nG1 X40 Y0 E0.5\n"
+            layer(0.8),
+            format_args!(";TYPE:Perimeter\n{}", wall(2, "loop")),
+            format_args!(
+                "{}{}",
+                layer(1.0),
+                ";TYPE:Top solid infill\nG1 X40 Y0 E0.5\n"
+            )
         ));
         let out = run(&source, &Config::default());
         assert!(
@@ -919,18 +963,20 @@ mod tests {
             ";LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.2 F9000\n{}\
              ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.4 F9000\n{}\
              ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.6 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Solid infill\nG1 X0 Y0 Z0.8 F9000\nG1 X10 Y0 E0.5\n",
+             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.8 F9000\n{}\
+             ;LAYER_CHANGE\n;TYPE:Solid infill\nG1 X0 Y0 Z1.0 F9000\nG1 X10 Y0 E0.5\n",
             wall(2, "first"),
             wall(2, "second"),
+            wall(2, "third"),
             wall(2, "above"),
         ));
         let out = run(&source, &Config::default());
         assert!(
-            out.contains("G1 Z0.300 F720 ; bricklayers brick raised"),
+            out.contains("G1 Z0.450 F720 ; bricklayers brick raised"),
             "{out}"
         );
         assert!(
-            out.contains("G1 Z0.500 F720 ; bricklayers brick raised"),
+            out.contains("G1 Z0.700 F720 ; bricklayers brick raised"),
             "{out}"
         );
         assert!(
@@ -1062,7 +1108,7 @@ mod tests {
         );
         let out = run(&source, &Config::default());
         let raise = out
-            .find("G1 Z0.500 F600 ; bricklayers brick raised")
+            .find("G1 Z0.900 F600 ; bricklayers brick raised")
             .expect("the wall is raised");
         let arc = out.find("; outer opens").expect("arc kept");
         assert!(
@@ -1149,7 +1195,7 @@ mod tests {
         ));
         let out = run(&source, &Config::default());
         let reset = out
-            .find("G1 Z0.400 F600 ; bricklayers brick reset")
+            .find("G1 Z0.800 F600 ; bricklayers brick reset")
             .expect("reset emitted");
         let infill = out.find(";TYPE:Solid infill").expect("marker kept");
         assert!(reset < infill, "Z must drop before infill starts:\n{out}");
@@ -1219,66 +1265,103 @@ mod tests {
         );
     }
 
+    /// The half layer a column is displaced by is paid over two layers rather
+    /// than in one bead, and given back in one when the column is capped.
     #[test]
-    fn first_and_last_layers_meter_the_gaps_the_stagger_leaves() {
-        let wall = format!(";TYPE:Perimeter\n{}", wall_of(2, "loop", 0.0, 10.0, 1.0));
-        let source = relative(&format!("{}{wall}{}{wall}", layer(0.2), layer(0.4)));
-        let config = Config {
-            extrusion_multiplier: 9.0,
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        // The first layer's raised bead reaches down to the bed, so it spans a
-        // layer and a half; the last one fills only the half the layer below
-        // left open.
-        assert!(out.contains("E1.50000"), "first layer 1.5x missing:\n{out}");
-        assert!(out.contains("E0.50000"), "last layer 0.5x missing:\n{out}");
-    }
-
-    #[test]
-    fn a_thicker_first_layer_gets_the_flow_its_own_gap_needs() {
-        // A 0.6 mm first layer under 0.8 mm layers: the raised bead spans 0.6
-        // plus the 0.4 shift, so it needs 1.667x, not the 1.5x that only holds
-        // when the two heights are equal.
-        let source = format!(
-            "; layer_height = 0.8\n\
-             ; first_layer_height = 0.6\n\
-             M83\n\
-             ;LAYER_CHANGE\n\
-             G1 Z0.60 F600\n\
-             ;TYPE:Perimeter\n{}\
-             ;LAYER_CHANGE\n\
-             G1 Z1.40 F600\n\
-             ;TYPE:Perimeter\n{}\
-             ;LAYER_CHANGE\n\
-             G1 Z2.20 F600\n\
-             ;TYPE:Solid infill\n\
-             G1 X40 Y0 E1.0\n",
-            wall_of(2, "loop", 0.0, 10.0, 1.0),
-            wall_of(2, "above", 0.0, 10.0, 1.0)
-        );
+    fn a_column_climbs_to_its_offset_instead_of_jumping() {
+        let mut source = String::from("; layer_height = 0.2\nM83\n");
+        for index in 0..5 {
+            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
+            source.push_str(";TYPE:Perimeter\n");
+            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
+        }
         let out = run(&source, &Config::default());
+        let flow = |tag: &str| {
+            out.lines()
+                .find(|line| line.ends_with(tag))
+                .map(|line| Line::parse(line).e.expect("an extrusion"))
+                .unwrap_or_else(|| panic!("{tag} missing from:\n{out}"))
+        };
+        // Flat on the bed, a quarter of a layer taller on each of the two
+        // climbing layers, as sliced once the column is up, and half a layer
+        // short where the cap gives the climb back.
+        assert_eq!(flow("L0loop2"), 1.0, "bed layer");
+        assert_eq!(flow("L1loop2"), 1.25, "first climb");
+        assert_eq!(flow("L2loop2"), 1.25, "second climb");
+        assert_eq!(flow("L3loop2"), 1.0, "column up");
+        assert_eq!(flow("L4loop2"), 0.5, "cap");
         assert!(
-            out.contains("G1 Z1.000 F600 ; bricklayers brick raised"),
-            "{out}"
+            out.contains("G1 Z0.450 F600 ; bricklayers brick raised"),
+            "half the shift on the first climb:\n{out}"
         );
-        assert!(out.contains("E1.66667 ; loop2"), "{out}");
         assert!(
-            !out.contains("E1.50000"),
-            "1.5x assumes the first layer is a layer height:\n{out}"
+            out.contains("G1 Z0.700 F600 ; bricklayers brick raised"),
+            "full shift on the second:\n{out}"
         );
     }
 
+    /// A bead on the bed is pressed against the build plate rather than
+    /// against a layer, so raising it presses nothing and the extra flow it
+    /// would need spreads sideways. There is no seam under it to stagger
+    /// either. On a Benchy this filled in the bottom nameplate, which is one
+    /// layer deep.
     #[test]
-    fn the_first_layer_height_may_be_given_when_the_file_omits_it() {
+    fn the_layer_laid_on_the_bed_is_never_raised() {
+        let mut source = String::from("; layer_height = 0.2\nM83\n");
+        for index in 0..4 {
+            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
+            source.push_str(";TYPE:Perimeter\n");
+            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
+        }
+        let outcome = apply(&source, &Config::default());
+        let bed: Vec<&str> = outcome
+            .gcode
+            .lines()
+            .take_while(|line| !line.contains("L1loop"))
+            .collect();
+        assert!(
+            !bed.iter().any(|line| line.contains("raised")),
+            "nothing may be raised on the bed layer:\n{}",
+            bed.join("\n")
+        );
+        assert!(
+            bed.iter().all(|line| !line.contains("E1.5")),
+            "nor over-extruded:\n{}",
+            bed.join("\n")
+        );
+    }
+
+    /// The cap gives back exactly what the column climbed, which is less than
+    /// half a layer when the wall ended before it finished climbing.
+    #[test]
+    fn a_cap_gives_back_only_the_climb_the_column_took() {
+        let mut source = String::from("; layer_height = 0.2\nM83\n");
+        for index in 0..3 {
+            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
+            source.push_str(";TYPE:Perimeter\n");
+            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
+        }
+        let out = run(&source, &Config::default());
+        let flow = |tag: &str| {
+            out.lines()
+                .find(|line| line.ends_with(tag))
+                .map(|line| Line::parse(line).e.expect("an extrusion"))
+                .unwrap_or_else(|| panic!("{tag} missing from:\n{out}"))
+        };
+        assert_eq!(flow("L1loop2"), 1.25, "climbed a quarter of a layer");
+        assert_eq!(flow("L2loop2"), 0.75, "so the cap gives a quarter back");
+    }
+
+    /// A wall that stands for two layers never climbs, so it is left exactly
+    /// as the slicer wrote it. Embossed text and other one- or two-layer
+    /// detail lands here.
+    #[test]
+    fn a_wall_too_short_to_climb_is_left_alone() {
         let wall = format!(";TYPE:Perimeter\n{}", wall_of(2, "loop", 0.0, 10.0, 1.0));
         let source = relative(&format!("{}{wall}{}{wall}", layer(0.2), layer(0.4)));
-        let config = Config {
-            first_layer_height: Some(0.4),
-            ..Config::default()
-        };
-        // 0.4 mm laid down, raised 0.1: (0.4 + 0.1) / 0.4.
-        assert!(run(&source, &config).contains("E1.25000"));
+        let out = run(&source, &Config::default());
+        assert!(!out.contains("raised"), "{out}");
+        assert!(!out.contains("E1.25000"), "{out}");
     }
 
     #[test]
@@ -1379,7 +1462,7 @@ mod tests {
     #[test]
     fn absolute_extrusion_stays_continuous() {
         let source = format!(
-            "; layer_height = 0.2\nM82\n{}{};TYPE:Perimeter\n\
+            "; layer_height = 0.2\nM82\n{}{}{}{};TYPE:Perimeter\n\
              G1 X0.45 Y0.45 F9000\n\
              G1 X9.55 Y0.45 E1.0 ; loop1\n\
              G1 X9.55 Y9.55 E2.0\n\
@@ -1399,6 +1482,8 @@ mod tests {
             layer(0.2),
             layer(0.4),
             layer(0.6),
+            layer(0.8),
+            layer(1.0),
         );
         let config = Config {
             extrusion_multiplier: 2.0,
@@ -1578,10 +1663,9 @@ mod tests {
         }
         let out = run(&source, &Config::default());
 
-        // The bead of a layer laid on the bed spans the first layer height
-        // plus the shift, so it is metered at 1.5x; the bead that caps an
-        // object fills the half gap the one below left, so it is metered at
-        // 0.5x. Everything between is left as the slicer metered it.
+        // A column climbs over the two layers above the bed and gives the
+        // climb back where it is capped, and it does that once per object
+        // rather than once per file.
         let flow = |tag: &str| {
             out.lines()
                 .find(|line| line.ends_with(tag))
@@ -1591,18 +1675,23 @@ mod tests {
         for object in 1..=2 {
             assert_eq!(
                 flow(&format!("o{object}L0loop2")),
-                0.75,
+                0.5,
                 "object {object} bed layer"
+            );
+            assert_eq!(
+                flow(&format!("o{object}L1loop2")),
+                0.625,
+                "object {object} first climb"
+            );
+            assert_eq!(
+                flow(&format!("o{object}L2loop2")),
+                0.625,
+                "object {object} second climb"
             );
             assert_eq!(
                 flow(&format!("o{object}L3loop2")),
                 0.25,
                 "object {object} top layer"
-            );
-            assert_eq!(
-                flow(&format!("o{object}L1loop2")),
-                0.5,
-                "object {object} middle"
             );
         }
     }
@@ -1638,7 +1727,7 @@ mod tests {
         let stats = apply(&source, &Config::default()).stats;
         assert_eq!(stats.loops, 3);
         assert_eq!(stats.raised, 1);
-        assert_eq!(stats.layers, 3);
+        assert_eq!(stats.layers, 5);
         assert_eq!(stats.layer_height, 0.2);
         assert!(stats.layer_height_detected);
     }

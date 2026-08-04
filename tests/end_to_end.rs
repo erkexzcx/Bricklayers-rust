@@ -311,14 +311,16 @@ fn a_rewrite_keeps_the_permissions_the_file_had() {
     assert_eq!(mode(&target), 0o600, "a copy widened the file");
 }
 
+/// A bead laid on the build plate is pressed against the plate rather than
+/// against a layer, so raising it presses nothing and the extra flow it would
+/// need spreads sideways. There is no seam under it to stagger either. On a
+/// Benchy this filled in the bottom nameplate, which is one layer deep.
 #[test]
-fn the_slicer_environment_supplies_the_first_layer_height() {
-    let sandbox = Sandbox::new("env-first-layer");
+fn the_layer_laid_on_the_bed_is_left_exactly_as_sliced() {
+    let sandbox = Sandbox::new("bed-layer");
     let path = sandbox.with_gcode(&sample_gcode());
     let file = path.to_str().unwrap();
 
-    // A 0.3 mm first layer under 0.2 mm layers: raised, its bead spans that
-    // plus the 0.1 shift, so it needs 4/3 of the flow rather than 3/2.
     let output = run_with_env(
         &["brick", file],
         &[
@@ -330,10 +332,14 @@ fn the_slicer_environment_supplies_the_first_layer_height() {
 
     let result = fs::read_to_string(&path).expect("read result");
     assert_wellformed(&result);
-    assert!(result.contains("E0.85333"), "0.64 x 4/3 missing");
+    let bed: String = result
+        .lines()
+        .take_while(|line| !line.contains("Z0.4"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !result.contains("E0.96000"),
-        "0.64 x 3/2 assumes both heights are equal"
+        !bed.contains("bricklayers"),
+        "the bed layer must come through untouched:\n{bed}"
     );
 }
 
@@ -376,8 +382,9 @@ fn verbose_reports_a_summary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("5 layers"), "{stderr}");
     assert!(stderr.contains("10 internal loops"), "{stderr}");
-    // One per layer, less the top one, which caps the wall flat.
-    assert!(stderr.contains("4 raised"), "{stderr}");
+    // One per layer, less the bed layer, which is never raised, and the top
+    // one, which caps the wall flat.
+    assert!(stderr.contains("3 raised"), "{stderr}");
     assert!(stderr.contains("in raised loops"), "{stderr}");
     assert!(
         stderr.contains("--extrusion-multiplier 1.05"),
@@ -463,7 +470,7 @@ fn two_walls_are_bricked_rather_than_refused() {
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(!report.contains("wall(s)"), "{report}");
-    assert!(report.contains("4 raised"), "{report}");
+    assert!(report.contains("3 raised"), "{report}");
 }
 
 /// One wall is the visible one, with nothing hidden behind it to shift, so the

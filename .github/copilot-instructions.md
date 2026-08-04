@@ -87,7 +87,10 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
   finds nothing on half the real files.
 - **Test fixtures must look like real slicer output**: `G1 Z...` before the
   `;TYPE:` marker, two or more genuinely adjacent loops per wall (use `wall_of`),
-  inner loop printed first.
+  inner loop printed first, and a wall on the layer above the one under test.
+  A fixture also needs five layers before it sees steady-state flow — the bed
+  layer is never raised and the two above it are climbing, so anything shallower
+  measures a climb (`middle_layer()` builds one correctly).
 - **`gcode::write_fixed` and `gcode::number` must stay bit-identical to `core`.**
   They are a fast path, not a different answer: `write_fixed` falls back to
   `{:.N}` whenever scaling could have crossed a half-way point, and `number`
@@ -114,16 +117,23 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
   layer with the previous layer's — a Z-hop only ever raises the nozzle, so a
   per-layer minimum is the layer's own height. Measured on a real OrcaSlicer
   2-object slice: one drop, 21.8 mm to 0.2 mm at layer 109 of 218.
+- **The layer laid on the bed is never raised, and a column climbs to its offset
+  over `RAMP` (2) layers.** A bead on the plate is not pressed by the nozzle, so
+  the flow a raise needs spreads sideways instead of building height — it filled
+  in a Benchy's bottom nameplate, which is exactly one layer deep.
+  `extrusion_factor` is one formula,
+  `(layer_height + rise(k) - rise(k-1)) / layer_height`, covering the bed, the
+  climb, the steady state and the cap. Do not special-case any of them back.
 - **Every number that reaches the nozzle is checked at the boundary.** `cli::within`
   refuses a value that is not finite and in range, and a layer height is filtered
-  by `scan::is_a_height` at all four places it can arrive: CLI, slicer
-  environment, bgcode metadata and the survey.
+  by `scan::is_a_height` at every place it can arrive: CLI, slicer environment,
+  bgcode metadata and the survey.
 
 ## Conventions
 
 - Doc comments explain *why*, and cite the measurement when a constant encodes
-  one — see `MAX_LOOP_GAP` and `PROBES` in `src/brick.rs`. Do not add comments
-  that restate the next line.
+  one — see `MAX_LOOP_GAP`, `PROBES` and `RAMP` in `src/brick.rs`. Do not add
+  comments that restate the next line.
 - No `unsafe`. Errors are `crate::Result` over a `thiserror` enum; `unwrap` only
   in tests and where a comment shows it cannot fire.
 - Dependencies are deliberately few (`clap`, `crc32fast`, `flate2`, `thiserror`).

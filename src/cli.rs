@@ -95,11 +95,6 @@ pub struct BrickArgs {
     #[arg(long, value_parser = layer_height, value_name = "MM")]
     pub layer_height: Option<f64>,
 
-    /// Height of the first layer in mm. Read from the file when omitted, and
-    /// assumed equal to the layer height when the file does not say.
-    #[arg(long, value_parser = layer_height, value_name = "MM")]
-    pub first_layer_height: Option<f64>,
-
     /// Extrusion scale for raised loops on middle layers. Accepts 1.0 to 1.3.
     #[arg(
         long,
@@ -161,7 +156,6 @@ impl From<&BrickArgs> for brick::Config {
     fn from(args: &BrickArgs) -> Self {
         Self {
             layer_height: args.layer_height,
-            first_layer_height: args.first_layer_height,
             extrusion_multiplier: args.extrusion_multiplier,
             external_perimeters_first: args.wall_order.chosen() == Some(WallOrder::ExternalFirst),
             reorder_loops: args.reorder_loops,
@@ -190,7 +184,6 @@ mod tests {
         assert_eq!(args.wall_order, WallOrderArg::Auto);
         assert_eq!(args.wall_order.chosen(), None);
         assert_eq!(config.layer_height, None);
-        assert_eq!(config.first_layer_height, None);
         assert_eq!(cli.command.common().input, PathBuf::from("part.gcode"));
     }
 
@@ -256,20 +249,32 @@ mod tests {
     }
 
     #[test]
-    fn brick_takes_both_layer_heights() {
+    fn brick_takes_the_layer_height() {
         let cli = Cli::parse_from([
             "bricklayers",
             "brick",
             "--layer-height",
             "0.2",
-            "--first-layer-height",
-            "0.3",
             "part.gcode",
         ]);
         let Command::Brick(args) = &cli.command;
-        let config = brick::Config::from(args);
-        assert_eq!(config.layer_height, Some(0.2));
-        assert_eq!(config.first_layer_height, Some(0.3));
+        assert_eq!(brick::Config::from(args).layer_height, Some(0.2));
+    }
+
+    /// The layer laid on the bed is never raised now, so the first layer's own
+    /// height no longer changes any output and the flag that set it is gone.
+    #[test]
+    fn the_first_layer_height_is_no_longer_an_argument() {
+        assert!(
+            Cli::try_parse_from([
+                "bricklayers",
+                "brick",
+                "--first-layer-height",
+                "0.3",
+                "part.gcode",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -310,8 +315,6 @@ mod tests {
             "--layer-height=-0.4",
             "--layer-height=inf",
             "--layer-height=3",
-            "--first-layer-height=0",
-            "--first-layer-height=nan",
             "--extrusion-multiplier=0.9",
             "--extrusion-multiplier=nan",
         ];
@@ -325,11 +328,7 @@ mod tests {
 
     #[test]
     fn the_settings_a_print_actually_uses_are_still_accepted() {
-        for accepted in [
-            "--layer-height=0.2",
-            "--first-layer-height=0.3",
-            "--extrusion-multiplier=1.05",
-        ] {
+        for accepted in ["--layer-height=0.2", "--extrusion-multiplier=1.05"] {
             assert!(
                 Cli::try_parse_from(["bricklayers", "brick", accepted, "part.gcode"]).is_ok(),
                 "brick {accepted} should be accepted"

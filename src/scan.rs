@@ -31,10 +31,6 @@ pub struct Survey {
     pub layer_height: f64,
     /// True when the layer height came from the file rather than the fallback.
     pub layer_height_detected: bool,
-    /// Height of the first layer, which slicers commonly print thicker than the
-    /// rest. `None` when the file never states it; it is never measured, since
-    /// a start G-code that lifts the nozzle to prime would be mistaken for it.
-    pub first_layer_height: Option<f64>,
     /// Order the file says its walls were printed in, from the configuration
     /// slicers append to the G-code. It cannot be measured from the moves
     /// themselves, so a file processed by hand has no other source.
@@ -106,7 +102,6 @@ impl Survey {
 struct Scan {
     layers: usize,
     declared_height: Option<f64>,
-    declared_first_height: Option<f64>,
     wall_order: Option<WallOrder>,
     /// Distinct upward Z steps and how often each was seen, so the commonest
     /// one can stand in for a layer height the file never states.
@@ -163,10 +158,6 @@ impl Scan {
                 if key.eq_ignore_ascii_case("layer_height") {
                     if let Ok(height) = value.parse() {
                         self.declared_height.get_or_insert(height);
-                    }
-                } else if key.eq_ignore_ascii_case("first_layer_height") {
-                    if let Ok(height) = value.parse() {
-                        self.declared_first_height.get_or_insert(height);
                     }
                 } else if key.eq_ignore_ascii_case("wall_sequence")
                     || key.eq_ignore_ascii_case("external_perimeters_first")
@@ -256,7 +247,6 @@ impl Scan {
             layer_markers,
             layer_height: layer_height.unwrap_or(FALLBACK_LAYER_HEIGHT),
             layer_height_detected: layer_height.is_some(),
-            first_layer_height: self.declared_first_height.filter(is_a_height),
             wall_order: self.wall_order,
             z_feedrate: self.z_feedrate,
             bricked: self.bricked,
@@ -308,12 +298,6 @@ mod tests {
         assert_eq!(survey.layer_height, 0.15);
     }
 
-    #[test]
-    fn reads_the_first_layer_height_as_its_own_setting() {
-        let survey = Survey::of("; first_layer_height = 0.3\n; layer_height = 0.15\n");
-        assert_eq!(survey.first_layer_height, Some(0.3));
-    }
-
     /// Wall order cannot be measured from the moves — marker transitions come
     /// out 50/50 whichever order was used — but slicers append the setting to
     /// the file, which is the only source a run by hand has.
@@ -356,17 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn the_first_layer_height_is_never_guessed() {
-        // A start G-code that lifts the nozzle to prime would otherwise be read
-        // as a very thick first layer.
-        let survey = Survey::of("G1 Z5 F600\nG1 Z0.2\nG1 Z0.4\n");
-        assert_eq!(survey.first_layer_height, None);
-    }
-
-    #[test]
     fn rejects_heights_that_are_not_a_length() {
-        let survey = Survey::of("; first_layer_height = 0\n; layer_height = -1\nG1 Z0.3\n");
-        assert_eq!(survey.first_layer_height, None);
+        let survey = Survey::of("; layer_height = -1\nG1 Z0.3\n");
         assert_eq!(survey.layer_height, 0.3);
     }
 

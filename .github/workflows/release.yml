@@ -15,14 +15,10 @@ jobs:
   prepare:
     name: Vendor dependencies
     runs-on: ubuntu-latest
+    container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-
-      - name: Set up Rust
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
 
       - name: Vendor crate sources
         run: |
@@ -37,90 +33,67 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Every build runs in a pinned prebuilt image that already holds Rust, the cross
+  # toolchain and the target: nothing is apt-installed or compiled to make a build
+  # possible, which is what used to dominate the run.
   build-binaries:
     name: Build ${{ matrix.os_name }} ${{ matrix.arch }} binary
     runs-on: ubuntu-latest
     needs: prepare
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Zig links these and carries its own libc and macOS SDK, so no Apple host.
           - target: x86_64-unknown-linux-musl
             os_name: linux
             arch: amd64
-            apt_packages: musl-tools
-            linker: musl-gcc
-            cargo_command: build
+            container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
+            cargo_command: zigbuild
             suffix: ''
           - target: aarch64-unknown-linux-musl
             os_name: linux
             arch: arm64
-            apt_packages: gcc-aarch64-linux-gnu
-            linker: aarch64-linux-gnu-gcc
-            cargo_command: build
+            container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
+            cargo_command: zigbuild
             suffix: ''
-          - target: x86_64-pc-windows-gnu
-            os_name: windows
-            arch: amd64
-            apt_packages: gcc-mingw-w64-x86-64
-            linker: x86_64-w64-mingw32-gcc
-            cargo_command: build
-            suffix: .exe
-          # No mingw for arm64 in apt, so this one goes through the MSVC toolchain that
-          # cargo-xwin downloads.
-          - target: aarch64-pc-windows-msvc
-            os_name: windows
-            arch: arm64
-            apt_packages: clang lld
-            linker: ''
-            cargo_command: xwin build
-            suffix: .exe
-          # Zig carries its own macOS libc stubs, so these need no Apple SDK and no Apple host.
           - target: aarch64-apple-darwin
             os_name: darwin
             arch: arm64
-            apt_packages: ''
-            linker: ''
+            container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
             cargo_command: zigbuild
             suffix: ''
           - target: x86_64-apple-darwin
             os_name: darwin
             arch: amd64
-            apt_packages: ''
-            linker: ''
+            container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
             cargo_command: zigbuild
             suffix: ''
+          # Both Windows arches go through the MSVC toolchain cargo-xwin assembles, the
+          # one Rust ships its own installer as, so no mingw and no second dialect.
+          - target: x86_64-pc-windows-msvc
+            os_name: windows
+            arch: amd64
+            container: ghcr.io/rust-cross/cargo-xwin:0.23.0
+            cargo_command: xwin build
+            suffix: .exe
+          - target: aarch64-pc-windows-msvc
+            os_name: windows
+            arch: arm64
+            container: ghcr.io/rust-cross/cargo-xwin:0.23.0
+            cargo_command: xwin build
+            suffix: .exe
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Install cross linker
-        if: matrix.apt_packages != ''
-        env:
-          APT_PACKAGES: ${{ matrix.apt_packages }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ${APT_PACKAGES}
-
-      - name: Set up Rust
+      # A no-op on an unchanged image, and the error the build would otherwise give if
+      # one of them ever drops a target.
+      - name: Confirm the target is installed
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustup target add "${TARGET}"
-
-      # These must run before the vendored sources land, or cargo install would look for the
-      # helper in this project's vendor directory instead of crates.io.
-      - name: Install Zig and cargo-zigbuild
-        if: matrix.cargo_command == 'zigbuild'
-        run: |
-          pip install --break-system-packages ziglang
-          cargo install --locked cargo-zigbuild
-
-      - name: Install cargo-xwin
-        if: startsWith(matrix.cargo_command, 'xwin')
-        run: cargo install --locked cargo-xwin
+        run: rustup target add "${TARGET}"
 
       - name: Download vendored dependencies
         uses: actions/download-artifact@v8
@@ -136,7 +109,6 @@ jobs:
       - name: Build binary
         env:
           TARGET: ${{ matrix.target }}
-          LINKER: ${{ matrix.linker }}
           CARGO_COMMAND: ${{ matrix.cargo_command }}
           TAG_NAME: ${{ github.event.release.tag_name }}
           # Accepts Microsoft's licence for the CRT and SDK headers cargo-xwin downloads.
@@ -145,10 +117,6 @@ jobs:
           # The published tag is the only version this project has; a build from source
           # has no release behind it and reports "dev" instead.
           export BRICKLAYERS_VERSION="${TAG_NAME#v}"
-          # Every target is cross-compiled from x86_64, so rustc needs the matching linker.
-          if [ -n "${LINKER}" ]; then
-            export "CARGO_TARGET_$(echo "${TARGET}" | tr 'a-z-' 'A-Z_')_LINKER=${LINKER}"
-          fi
           cargo ${CARGO_COMMAND} --release --locked --offline --target "${TARGET}"
 
       - name: Name release asset

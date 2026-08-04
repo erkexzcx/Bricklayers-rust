@@ -18,7 +18,7 @@ pub mod slicer;
 pub use error::{Error, Result};
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::scan::Survey;
@@ -31,11 +31,10 @@ const WRITE_BUFFER: usize = 256 * 1024;
 /// go back into.
 ///
 /// The transform needs a [`Survey`] of the whole file before it can rewrite any
-/// of it, so the input is read twice. Plain text is re-read from the disk
-/// and never held in memory. Binary G-code is decoded once and kept, because
-/// its blocks have to be unpacked before a single line can be read; that costs
-/// the size of the decoded G-code and nothing more, since the rewrite still
-/// streams back out.
+/// of it, so the input is read twice and never held in memory. A binary
+/// container costs one walk over its block headers when it is opened, which is
+/// what a rewrite has to put back around the G-code; its blocks are then
+/// unpacked one at a time on each pass.
 #[derive(Clone, Debug)]
 pub struct Source {
     path: PathBuf,
@@ -45,10 +44,7 @@ pub struct Source {
 #[derive(Clone, Debug)]
 enum Kind {
     Text,
-    Binary {
-        container: bgcode::Container,
-        gcode: String,
-    },
+    Binary { container: bgcode::Container },
 }
 
 impl Source {
@@ -65,17 +61,15 @@ impl Source {
             });
         }
 
-        let mut bytes = magic[..read].to_vec();
-        file.read_to_end(&mut bytes)
-            .map_err(|source| Error::io(&path, source))?;
-        let (container, gcode) = bgcode::parse(&bytes).map_err(|reason| Error::Bgcode {
-            path: path.clone(),
-            reason,
-        })?;
+        let container = bgcode::Container::read(BufReader::with_capacity(WRITE_BUFFER, file))
+            .map_err(|reason| Error::Bgcode {
+                path: path.clone(),
+                reason,
+            })?;
 
         Ok(Self {
             path,
-            kind: Kind::Binary { container, gcode },
+            kind: Kind::Binary { container },
         })
     }
 
@@ -106,22 +100,19 @@ impl Source {
         }
     }
 
-    /// The decoded G-code, for a binary container only.
-    pub fn decoded(&self) -> Option<&str> {
-        match &self.kind {
-            Kind::Text => None,
-            Kind::Binary { gcode, .. } => Some(gcode),
-        }
-    }
-
     /// A reader positioned at the start. Each call is an independent pass.
-    pub fn reader(&self) -> Result<Reader<'_>> {
+    pub fn reader(&self) -> Result<Reader> {
+        let file = File::open(&self.path).map_err(|s| Error::io(&self.path, s))?;
+        let input = BufReader::with_capacity(WRITE_BUFFER, file);
+
         Ok(Reader(match &self.kind {
-            Kind::Text => {
-                let file = File::open(&self.path).map_err(|s| Error::io(&self.path, s))?;
-                Stream::File(BufReader::with_capacity(WRITE_BUFFER, file))
+            Kind::Text => Stream::File(input),
+            Kind::Binary { container } => {
+                Stream::Blocks(container.blocks(input).map_err(|reason| Error::Bgcode {
+                    path: self.path.clone(),
+                    reason,
+                })?)
             }
-            Kind::Binary { gcode, .. } => Stream::Memory(Cursor::new(gcode.as_bytes())),
         }))
     }
 
@@ -162,7 +153,7 @@ impl Source {
     pub fn rewrite<T>(
         &self,
         mut sink: Sink,
-        transform: impl FnOnce(Reader<'_>, &mut Sink) -> io::Result<T>,
+        transform: impl FnOnce(Reader, &mut Sink) -> io::Result<T>,
     ) -> Result<T> {
         let outcome = {
             let reader = self.reader()?;
@@ -174,34 +165,34 @@ impl Source {
 }
 
 /// One pass over a [`Source`].
-pub struct Reader<'a>(Stream<'a>);
+pub struct Reader(Stream);
 
-enum Stream<'a> {
+enum Stream {
     File(BufReader<File>),
-    Memory(Cursor<&'a [u8]>),
+    Blocks(bgcode::BlockReader<BufReader<File>>),
 }
 
-impl Read for Reader<'_> {
+impl Read for Reader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match &mut self.0 {
             Stream::File(reader) => reader.read(buffer),
-            Stream::Memory(reader) => reader.read(buffer),
+            Stream::Blocks(reader) => reader.read(buffer),
         }
     }
 }
 
-impl BufRead for Reader<'_> {
+impl BufRead for Reader {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         match &mut self.0 {
             Stream::File(reader) => reader.fill_buf(),
-            Stream::Memory(reader) => reader.fill_buf(),
+            Stream::Blocks(reader) => reader.fill_buf(),
         }
     }
 
     fn consume(&mut self, amount: usize) {
         match &mut self.0 {
             Stream::File(reader) => reader.consume(amount),
-            Stream::Memory(reader) => reader.consume(amount),
+            Stream::Blocks(reader) => reader.consume(amount),
         }
     }
 }

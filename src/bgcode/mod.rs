@@ -10,7 +10,7 @@
 mod heatshrink;
 mod meatpack;
 
-use std::io::{self, Read as _, Write};
+use std::io::{self, BufRead, Cursor, Read, Seek, SeekFrom, Write};
 
 use flate2::Compression as Level;
 use flate2::read::{ZlibDecoder, ZlibEncoder};
@@ -19,6 +19,8 @@ const MAGIC: &[u8; 4] = b"GCDE";
 const HEADER: usize = 10;
 const VERSION: u32 = 1;
 const GCODE_BLOCK: u16 = 1;
+/// A block's trailing CRC32, when the file carries checksums at all.
+const CHECKSUM: usize = 4;
 
 /// Uncompressed bytes per generated G-code block, matching the order of
 /// magnitude a slicer emits so firmware still streams the file in small steps.
@@ -45,6 +47,89 @@ pub struct Container {
 }
 
 impl Container {
+    /// Walks a container's block chain, keeping only what a rewrite has to put
+    /// back: the blocks that are not G-code, byte for byte, and the two heights
+    /// a binary file states outside its G-code stream.
+    ///
+    /// G-code payloads are stepped over rather than unpacked, so this costs a
+    /// walk over the block headers and no memory that grows with the print.
+    /// Their checksums are therefore left to [`Container::blocks`], which is
+    /// still a pass earlier than the first byte of output.
+    pub fn read<R: BufRead + Seek>(mut input: R) -> Result<Self, String> {
+        let length = input
+            .seek(SeekFrom::End(0))
+            .and_then(|length| input.rewind().map(|()| length))
+            .map_err(|error| format!("cannot be read: {error}"))?;
+        let (version, checksums) = file_header(&mut input)?;
+
+        let trailer = if checksums { CHECKSUM } else { 0 };
+        let mut at = HEADER as u64;
+        let mut prelude = Vec::new();
+        let mut block = Vec::new();
+        let mut compression = Compression::Heatshrink12;
+        let mut layer_height = None;
+        let mut first_layer_height = None;
+
+        while !ended(&mut input)? {
+            let start = at;
+            block.clear();
+            let header = read_header(&mut input, &mut block, start)?;
+            at += block.len() as u64;
+            let rest = header.stored + trailer;
+
+            if header.kind == GCODE_BLOCK {
+                compression = header.packing;
+                if at + rest as u64 > length {
+                    return Err(format!("file ends inside the block at byte {start}"));
+                }
+                input
+                    .seek(SeekFrom::Current(rest as i64))
+                    .map_err(|error| format!("cannot be read: {error}"))?;
+                at += rest as u64;
+                continue;
+            }
+
+            take(&mut input, &mut block, rest, start)?;
+            at += rest as u64;
+            verify(&block, checksums, start)?;
+
+            if (layer_height.is_none() || first_layer_height.is_none())
+                && let Ok(ini) = decompress(
+                    payload(&block, &header, trailer),
+                    header.packing,
+                    header.uncompressed,
+                )
+            {
+                layer_height = layer_height.or_else(|| setting(&ini, "layer_height"));
+                first_layer_height =
+                    first_layer_height.or_else(|| setting(&ini, "first_layer_height"));
+            }
+            prelude.extend_from_slice(&block);
+        }
+
+        Ok(Self {
+            version,
+            checksums,
+            prelude,
+            compression,
+            layer_height,
+            first_layer_height,
+        })
+    }
+
+    /// A reader over the file's G-code, one block at a time.
+    pub fn blocks<R: BufRead>(&self, mut input: R) -> Result<BlockReader<R>, String> {
+        file_header(&mut input)?;
+        Ok(BlockReader {
+            input,
+            checksums: self.checksums,
+            at: HEADER as u64,
+            block: Vec::new(),
+            text: Vec::new(),
+            read: 0,
+        })
+    }
+
     /// A sink that packs a G-code stream into blocks as it is written, so a
     /// rewrite never has to exist in memory all at once.
     pub fn writer<W: Write>(&self, mut out: W) -> io::Result<BlockWriter<W>> {
@@ -160,83 +245,211 @@ fn block_end(pending: &[u8]) -> Option<usize> {
 }
 
 pub fn parse(bytes: &[u8]) -> Result<(Container, String), String> {
-    if !is_binary(bytes) || bytes.len() < HEADER {
-        return Err("missing GCDE magic number".into());
-    }
-    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    if version > VERSION {
-        return Err(format!("version {version} is newer than {VERSION}"));
-    }
-    let checksums = match u16::from_le_bytes(bytes[8..10].try_into().unwrap()) {
-        0 => false,
-        1 => true,
-        other => return Err(format!("unknown checksum type {other}")),
-    };
+    let container = Container::read(Cursor::new(bytes))?;
+    let mut gcode = Vec::new();
+    container
+        .blocks(Cursor::new(bytes))?
+        .read_to_end(&mut gcode)
+        .map_err(|error| error.to_string())?;
+    Ok((container, String::from_utf8_lossy(&gcode).into_owned()))
+}
 
-    let mut at = HEADER;
-    let mut prelude = Vec::new();
-    let mut gcode = String::new();
-    let mut compression = Compression::Heatshrink12;
-    let mut layer_height = None;
-    let mut first_layer_height = None;
+/// Decodes a container's G-code blocks one at a time.
+///
+/// Only the block being read is unpacked, so a pass over a print's worth of
+/// G-code costs one block of memory however long the print is. Blocks that are
+/// not G-code are stepped over: a rewrite puts back the copies
+/// [`Container::read`] kept.
+pub struct BlockReader<R: BufRead> {
+    input: R,
+    checksums: bool,
+    /// Byte offset of the next block, for error messages only.
+    at: u64,
+    /// Scratch holding the current block as it was stored.
+    block: Vec<u8>,
+    /// The current block, decoded.
+    text: Vec<u8>,
+    read: usize,
+}
 
-    while at < bytes.len() {
-        let start = at;
-        let kind = take_u16(bytes, &mut at)?;
-        let code = take_u16(bytes, &mut at)?;
-        let uncompressed = take_u32(bytes, &mut at)? as usize;
-        let packing = Compression::from_code(code)
-            .ok_or_else(|| format!("unknown compression type {code}"))?;
-        let stored = if packing == Compression::None {
-            uncompressed
-        } else {
-            take_u32(bytes, &mut at)? as usize
-        };
+impl<R: BufRead> BlockReader<R> {
+    /// Decodes the next G-code block, skipping anything else. `false` once the
+    /// chain has ended.
+    fn next_block(&mut self) -> Result<bool, String> {
+        let trailer = if self.checksums { CHECKSUM } else { 0 };
 
-        let parameters = take(bytes, &mut at, parameters_size(kind)?)?;
-        let data = take(bytes, &mut at, stored)?;
+        while !ended(&mut self.input)? {
+            let start = self.at;
+            self.block.clear();
+            let header = read_header(&mut self.input, &mut self.block, start)?;
+            self.at += self.block.len() as u64;
+            let rest = header.stored + trailer;
 
-        if checksums {
-            let expected = u32::from_le_bytes(take(bytes, &mut at, 4)?.try_into().unwrap());
-            let found = crc32fast::hash(&bytes[start..at - 4]);
-            if found != expected {
-                return Err(format!("checksum mismatch in the block at byte {start}"));
+            if header.kind != GCODE_BLOCK {
+                discard(&mut self.input, rest, start)?;
+                self.at += rest as u64;
+                continue;
             }
-        }
 
-        if kind == GCODE_BLOCK {
-            compression = packing;
-            let raw = decompress(data, packing, uncompressed)?;
-            let encoding = u16::from_le_bytes(parameters[..2].try_into().unwrap());
-            let text = match encoding {
+            take(&mut self.input, &mut self.block, rest, start)?;
+            self.at += rest as u64;
+            verify(&self.block, self.checksums, start)?;
+
+            let stored = payload(&self.block, &header, trailer);
+            let raw = decompress(stored, header.packing, header.uncompressed)?;
+            self.text = match header.encoding {
                 0 => raw,
                 1 | 2 => meatpack::decode(&raw),
                 other => return Err(format!("unknown G-code encoding {other}")),
             };
-            gcode.push_str(&String::from_utf8_lossy(&text));
-        } else {
-            prelude.extend_from_slice(&bytes[start..at]);
-            if (layer_height.is_none() || first_layer_height.is_none())
-                && let Ok(raw) = decompress(data, packing, uncompressed)
-            {
-                layer_height = layer_height.or_else(|| setting(&raw, "layer_height"));
-                first_layer_height =
-                    first_layer_height.or_else(|| setting(&raw, "first_layer_height"));
+            self.read = 0;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+impl<R: BufRead> BufRead for BlockReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.read == self.text.len() {
+            if !self.next_block().map_err(damaged)? {
+                break;
             }
         }
+        Ok(&self.text[self.read..])
     }
 
-    Ok((
-        Container {
-            version,
-            checksums,
-            prelude,
-            compression,
-            layer_height,
-            first_layer_height,
-        },
-        gcode,
-    ))
+    fn consume(&mut self, amount: usize) {
+        self.read = self.read.saturating_add(amount).min(self.text.len());
+    }
+}
+
+impl<R: BufRead> Read for BlockReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let taken = available.len().min(buffer.len());
+        buffer[..taken].copy_from_slice(&available[..taken]);
+        self.consume(taken);
+        Ok(taken)
+    }
+}
+
+/// A block that will not decode surfaces mid-pass rather than when the file was
+/// opened, so it has to carry its own description of what went wrong.
+fn damaged(reason: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("not valid binary G-code: {reason}"),
+    )
+}
+
+/// A block's fixed part: everything before its payload.
+struct Header {
+    kind: u16,
+    packing: Compression,
+    uncompressed: usize,
+    stored: usize,
+    encoding: u16,
+}
+
+/// The ten byte file header. `block` must be empty.
+fn file_header<R: Read>(input: &mut R) -> Result<(u32, bool), String> {
+    let mut head = [0u8; HEADER];
+    input
+        .read_exact(&mut head)
+        .map_err(|_| "missing GCDE magic number".to_string())?;
+    if !is_binary(&head) {
+        return Err("missing GCDE magic number".into());
+    }
+    let version = u32::from_le_bytes(head[4..8].try_into().unwrap());
+    if version > VERSION {
+        return Err(format!("version {version} is newer than {VERSION}"));
+    }
+    let checksums = match u16::from_le_bytes(head[8..10].try_into().unwrap()) {
+        0 => false,
+        1 => true,
+        other => return Err(format!("unknown checksum type {other}")),
+    };
+    Ok((version, checksums))
+}
+
+/// Reads one block's header into `block`, which must be empty.
+fn read_header<R: Read>(input: &mut R, block: &mut Vec<u8>, at: u64) -> Result<Header, String> {
+    take(input, block, 4, at)?;
+    let kind = u16::from_le_bytes(block[0..2].try_into().unwrap());
+    let code = u16::from_le_bytes(block[2..4].try_into().unwrap());
+    let packing =
+        Compression::from_code(code).ok_or_else(|| format!("unknown compression type {code}"))?;
+
+    let sizes = if packing == Compression::None { 4 } else { 8 };
+    take(input, block, sizes + parameters_size(kind)?, at)?;
+    let uncompressed = u32::from_le_bytes(block[4..8].try_into().unwrap()) as usize;
+    let stored = if packing == Compression::None {
+        uncompressed
+    } else {
+        u32::from_le_bytes(block[8..12].try_into().unwrap()) as usize
+    };
+    let encoding = u16::from_le_bytes(block[4 + sizes..6 + sizes].try_into().unwrap());
+
+    Ok(Header {
+        kind,
+        packing,
+        uncompressed,
+        stored,
+        encoding,
+    })
+}
+
+/// The stored payload of a complete block, between its header and its checksum.
+fn payload<'a>(block: &'a [u8], header: &Header, trailer: usize) -> &'a [u8] {
+    let end = block.len() - trailer;
+    &block[end - header.stored..end]
+}
+
+fn verify(block: &[u8], checksums: bool, at: u64) -> Result<(), String> {
+    if !checksums {
+        return Ok(());
+    }
+    let split = block.len() - CHECKSUM;
+    let expected = u32::from_le_bytes(block[split..].try_into().unwrap());
+    if crc32fast::hash(&block[..split]) != expected {
+        return Err(format!("checksum mismatch in the block at byte {at}"));
+    }
+    Ok(())
+}
+
+/// Whether the chain has ended exactly on a block boundary.
+fn ended<R: BufRead>(input: &mut R) -> Result<bool, String> {
+    input
+        .fill_buf()
+        .map(<[u8]>::is_empty)
+        .map_err(|error| format!("cannot be read: {error}"))
+}
+
+/// Appends exactly `count` bytes to `block`.
+///
+/// The count comes out of the file, so it is never reserved for up front: a
+/// corrupt length has to fail as a short read, not as a huge allocation.
+fn take<R: Read>(input: &mut R, block: &mut Vec<u8>, count: usize, at: u64) -> Result<(), String> {
+    let read = input
+        .by_ref()
+        .take(count as u64)
+        .read_to_end(block)
+        .map_err(|error| format!("cannot be read: {error}"))?;
+    if read != count {
+        return Err(format!("file ends inside the block at byte {at}"));
+    }
+    Ok(())
+}
+
+/// Steps over a block this pass has no use for.
+fn discard<R: Read>(input: &mut R, count: usize, at: u64) -> Result<(), String> {
+    let skipped = io::copy(&mut input.by_ref().take(count as u64), &mut io::sink())
+        .map_err(|error| format!("cannot be read: {error}"))?;
+    if skipped != count as u64 {
+        return Err(format!("file ends inside the block at byte {at}"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,23 +546,6 @@ fn setting(ini: &[u8], key: &str) -> Option<f64> {
         .filter(crate::scan::is_a_height)
 }
 
-fn take<'a>(bytes: &'a [u8], at: &mut usize, count: usize) -> Result<&'a [u8], String> {
-    let end = at.checked_add(count).ok_or("block size overflows")?;
-    let slice = bytes
-        .get(*at..end)
-        .ok_or_else(|| format!("file ends inside the block at byte {at}"))?;
-    *at = end;
-    Ok(slice)
-}
-
-fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, String> {
-    Ok(u16::from_le_bytes(take(bytes, at, 2)?.try_into().unwrap()))
-}
-
-fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(take(bytes, at, 4)?.try_into().unwrap()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,28 +563,49 @@ mod tests {
 
     /// Walks a serialized file and counts its G-code blocks.
     fn gcode_blocks(bytes: &[u8]) -> usize {
-        let checksums = u16::from_le_bytes(bytes[8..10].try_into().unwrap()) == 1;
-        let mut at = HEADER;
+        let mut input = Cursor::new(bytes);
+        let (_, checksums) = file_header(&mut input).expect("file header");
+        let trailer = if checksums { CHECKSUM } else { 0 };
+        let mut block = Vec::new();
         let mut blocks = 0;
 
-        while at < bytes.len() {
-            let kind = take_u16(bytes, &mut at).expect("block type");
-            let code = take_u16(bytes, &mut at).expect("compression");
-            let uncompressed = take_u32(bytes, &mut at).expect("size") as usize;
-            let packing = Compression::from_code(code).expect("known compression");
-            let stored = if packing == Compression::None {
-                uncompressed
-            } else {
-                take_u32(bytes, &mut at).expect("stored size") as usize
-            };
-            take(bytes, &mut at, parameters_size(kind).expect("parameters")).expect("parameters");
-            take(bytes, &mut at, stored).expect("payload");
-            if checksums {
-                take(bytes, &mut at, 4).expect("checksum");
-            }
-            blocks += usize::from(kind == GCODE_BLOCK);
+        while !ended(&mut input).expect("read") {
+            block.clear();
+            let header = read_header(&mut input, &mut block, 0).expect("block header");
+            discard(&mut input, header.stored + trailer, 0).expect("payload");
+            blocks += usize::from(header.kind == GCODE_BLOCK);
         }
         blocks
+    }
+
+    /// A container built by hand, so a block can hold exactly these bytes
+    /// rather than whatever the writer's own boundaries would produce.
+    fn packed(container: &Container, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&container.version.to_le_bytes());
+        bytes.extend_from_slice(&u16::from(container.checksums).to_le_bytes());
+        bytes.extend_from_slice(&container.prelude);
+        for chunk in chunks {
+            bytes.extend_from_slice(&container.block(chunk));
+        }
+        bytes
+    }
+
+    /// One metadata block, the shape a slicer writes its settings in.
+    fn metadata(container: &Container, kind: u16, ini: &str) -> Vec<u8> {
+        let payload = compress(ini.as_bytes(), container.compression);
+        let mut block = Vec::new();
+        block.extend_from_slice(&kind.to_le_bytes());
+        block.extend_from_slice(&container.compression.code().to_le_bytes());
+        block.extend_from_slice(&(ini.len() as u32).to_le_bytes());
+        block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        block.extend_from_slice(&0u16.to_le_bytes());
+        block.extend_from_slice(&payload);
+        if container.checksums {
+            block.extend_from_slice(&crc32fast::hash(&block).to_le_bytes());
+        }
+        block
     }
 
     #[test]
@@ -493,6 +710,143 @@ mod tests {
                 "chunk size {chunk}"
             );
         }
+    }
+
+    /// The whole point of the block reader: a file's G-code is decoded a block
+    /// at a time, so what is held never grows with the print.
+    #[test]
+    fn only_one_block_is_unpacked_at_a_time() {
+        let gcode = "G1 X123.456 Y234.567 E1.234\n".repeat(40_000);
+        let bytes = container().serialize(&gcode);
+        assert!(gcode_blocks(&bytes) > 10, "expected many blocks");
+
+        let mut reader = container()
+            .blocks(Cursor::new(&bytes[..]))
+            .expect("start reader");
+        let mut read = Vec::new();
+        let mut buffer = [0u8; 1024];
+
+        loop {
+            let taken = reader.read(&mut buffer).expect("read");
+            if taken == 0 {
+                break;
+            }
+            read.extend_from_slice(&buffer[..taken]);
+            assert!(
+                reader.text.len() <= BLOCK_TARGET * 2,
+                "{} bytes unpacked after {} read",
+                reader.text.len(),
+                read.len()
+            );
+        }
+        assert_eq!(read, gcode.as_bytes());
+    }
+
+    /// Blocks written elsewhere need not end on a line, and a reader that
+    /// returned bytes a block at a time would cut such a line in half.
+    #[test]
+    fn a_line_split_across_two_blocks_is_read_whole() {
+        let bytes = packed(&container(), &[b"G1 X1 Y1 ", b"E1\nG1 X2\n"]);
+        assert_eq!(gcode_blocks(&bytes), 2);
+
+        let mut lines = Vec::new();
+        let reader = container().blocks(Cursor::new(&bytes[..])).expect("reader");
+        for line in reader.lines() {
+            lines.push(line.expect("line"));
+        }
+        assert_eq!(lines, ["G1 X1 Y1 E1", "G1 X2"]);
+    }
+
+    /// Reading in awkward steps must not lose or repeat a byte at a block
+    /// boundary, whatever size the caller asks for.
+    #[test]
+    fn any_read_size_returns_the_same_stream() {
+        let gcode = "; a comment\nG1 X1 Y1 E1\n".repeat(8_000);
+        let bytes = container().serialize(&gcode);
+
+        for size in [1, 3, 4096, BLOCK_TARGET - 1, BLOCK_TARGET * 3] {
+            let mut reader = container().blocks(Cursor::new(&bytes[..])).expect("reader");
+            let mut read = Vec::new();
+            let mut buffer = vec![0u8; size];
+            loop {
+                let taken = reader.read(&mut buffer).expect("read");
+                if taken == 0 {
+                    break;
+                }
+                read.extend_from_slice(&buffer[..taken]);
+            }
+            assert_eq!(read, gcode.as_bytes(), "read size {size}");
+        }
+    }
+
+    /// Opening a file walks its block headers without unpacking any G-code, so
+    /// a G-code block that will not decode has to survive that walk and fail on
+    /// the pass that reads it — which is still before a byte of output.
+    #[test]
+    fn opening_a_file_does_not_decode_its_gcode() {
+        let sound = packed(&container(), &[b"G1 X1 Y1 E1\n"]);
+
+        // A size only a decode compares against what it unpacked. The stored
+        // length is untouched, so the walk still steps over exactly the block.
+        let mut lying = sound.clone();
+        lying[HEADER + 4..HEADER + 8].copy_from_slice(&99u32.to_le_bytes());
+        let repaired = crc32fast::hash(&lying[HEADER..lying.len() - CHECKSUM]);
+        let end = lying.len() - CHECKSUM;
+        lying[end..].copy_from_slice(&repaired.to_le_bytes());
+
+        Container::read(Cursor::new(&lying[..])).expect("the walk should not decode");
+        assert!(
+            parse(&lying).is_err(),
+            "a block that lies should not decode"
+        );
+
+        // And a G-code block's checksum, which the walk steps over with it.
+        let mut corrupt = sound.clone();
+        *corrupt.last_mut().unwrap() ^= 0xFF;
+
+        Container::read(Cursor::new(&corrupt[..])).expect("the walk should not checksum G-code");
+        assert!(parse(&corrupt).expect_err("corrupt").contains("checksum"));
+    }
+
+    /// A rewrite puts the prelude back before the G-code it packs, so a
+    /// metadata block that trailed the G-code must still be found and kept.
+    #[test]
+    fn metadata_is_found_wherever_it_sits() {
+        let source = container();
+        let mut bytes = packed(&source, &[b"G1 X1 Y1 E1\n"]);
+        let trailing = metadata(&source, 4, "layer_height=0.25\nfirst_layer_height=0.3\n");
+        bytes.extend_from_slice(&trailing);
+
+        let container = Container::read(Cursor::new(&bytes[..])).expect("walk the chain");
+        assert_eq!(container.layer_height, Some(0.25));
+        assert_eq!(container.first_layer_height, Some(0.3));
+        assert_eq!(container.prelude, trailing, "kept byte for byte");
+        assert_eq!(parse(&bytes).expect("decode").1, "G1 X1 Y1 E1\n");
+    }
+
+    /// A truncated file is refused when it is opened, before a transform has a
+    /// chance to write anything.
+    #[test]
+    fn a_file_that_ends_inside_a_block_is_refused() {
+        let bytes = container().serialize(&"G1 X1 Y1 E1\n".repeat(200));
+        for cut in [HEADER + 3, HEADER + 12, bytes.len() - 1] {
+            let error = Container::read(Cursor::new(&bytes[..cut]))
+                .expect_err("a short file should not parse");
+            assert!(error.contains("ends inside"), "{cut}: {error}");
+        }
+    }
+
+    /// A length taken from the file must fail as a short read rather than be
+    /// reserved for, or a corrupt header becomes a four gigabyte allocation.
+    #[test]
+    fn an_impossible_block_length_is_not_allocated_for() {
+        let mut bytes = container().serialize("G1 X1 Y1 E1\n");
+        bytes[HEADER + 8..HEADER + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            Container::read(Cursor::new(&bytes[..]))
+                .expect_err("an impossible length should not parse")
+                .contains("ends inside")
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! The fixtures are Prusa's own test files, so decoding them is the closest
 //! thing to testing against the reference implementation.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,14 +50,36 @@ fn run(args: &[&str]) -> std::process::Output {
     Command::new(BIN).args(args).output().expect("run binary")
 }
 
-/// Three layers of a wall with two internal perimeter loops.
+/// The G-code a [`Source`] hands a transform, however it is packed.
+fn streamed(path: &Path) -> String {
+    let source = Source::open(path).expect("open source");
+    let mut text = String::new();
+    source
+        .reader()
+        .expect("reader")
+        .read_to_string(&mut text)
+        .expect("read source");
+    text
+}
+
+/// Whatever a run left in the sandbox besides the file it was pointed at.
+fn leftovers(sandbox: &Sandbox) -> Vec<std::ffi::OsString> {
+    fs::read_dir(sandbox.path())
+        .expect("list sandbox")
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .filter(|name| name != "part.bgcode")
+        .collect()
+}
+
+/// A wall with two internal perimeter loops, over `layers` layers.
 ///
 /// Both fixtures are two-perimeter cubes, so their single internal loop has
 /// nothing to stagger against and the transform correctly leaves them alone.
 /// Repacking this into a real container gives the binary path something to do.
-fn brickable_gcode() -> String {
+fn brickable_gcode(layers: usize) -> String {
     let mut text = String::from("M83\n; layer_height = 0.2\n");
-    for z in [0.2_f64, 0.4, 0.6] {
+    for layer in 1..=layers {
+        let z = layer as f64 * 0.2;
         text.push_str(";LAYER_CHANGE\n");
         text.push_str(&format!("G1 Z{z:.3} F720\n"));
         text.push_str(";TYPE:External perimeter\n");
@@ -114,6 +137,9 @@ fn a_truncated_file_fails_with_a_readable_message() {
     );
 }
 
+/// A G-code block's checksum is only reached on the pass that decodes it,
+/// which is a pass earlier than the first byte of output — so the file the
+/// block came from has to survive being refused.
 #[test]
 fn a_corrupted_block_is_rejected() {
     let sandbox = Sandbox::new("corrupt");
@@ -124,13 +150,20 @@ fn a_corrupted_block_is_rejected() {
     let output = run(&["brick", path.to_str().unwrap()]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("checksum"));
+
+    assert_eq!(
+        fs::read(&path).expect("read result"),
+        damaged,
+        "input changed"
+    );
+    assert!(leftovers(&sandbox).is_empty(), "left a temporary behind");
 }
 
 #[test]
 fn brick_rewrites_binary_gcode_in_place() {
     let sandbox = Sandbox::new("brick-binary");
     let (container, _) = bgcode::parse(SINGLE).expect("fixture should parse");
-    let path = sandbox.with("part.bgcode", &container.serialize(&brickable_gcode()));
+    let path = sandbox.with("part.bgcode", &container.serialize(&brickable_gcode(3)));
 
     let output = run(&["brick", "--verbose", path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
@@ -142,12 +175,7 @@ fn brick_rewrites_binary_gcode_in_place() {
     assert!(gcode.contains("; bricklayers brick raised"), "{gcode}");
     assert!(gcode.contains(";TYPE:External perimeter\n"), "{gcode}");
 
-    let leftovers: Vec<_> = fs::read_dir(sandbox.path())
-        .expect("list sandbox")
-        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-        .filter(|name| name != "part.bgcode")
-        .collect();
-    assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    assert!(leftovers(&sandbox).is_empty(), "left a temporary behind");
 }
 
 /// The container must be a pure transport detail: the same input G-code has to
@@ -166,8 +194,37 @@ fn the_binary_path_matches_the_text_path() {
     }
 
     let from_text = fs::read_to_string(&text).expect("read text result");
-    let from_binary = Source::open(&binary).expect("read binary result");
-    assert_eq!(from_binary.decoded(), Some(from_text.as_str()));
+    assert_eq!(streamed(&binary), from_text);
+}
+
+/// A print's G-code fills many blocks, so a rewrite reads and writes across
+/// their boundaries in the middle of a wall. Blocks are a transport detail, so
+/// none of that may show in the result.
+#[test]
+fn a_rewrite_across_many_blocks_matches_the_text_path() {
+    let sandbox = Sandbox::new("many-blocks");
+    let (container, _) = bgcode::parse(SINGLE).expect("fixture should parse");
+    let gcode = brickable_gcode(2_000);
+    // The writer packs about 64 kB to a block, so this is roughly ten of them.
+    assert!(gcode.len() > 512 * 1024, "expected many blocks of G-code");
+
+    let text = sandbox.with("part.gcode", gcode.as_bytes());
+    let binary = sandbox.with("part.bgcode", &container.serialize(&gcode));
+
+    for path in [&text, &binary] {
+        let output = run(&["brick", "--layer-height", "0.2", path.to_str().unwrap()]);
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let rewritten = streamed(&binary);
+    assert!(
+        rewritten.contains("; bricklayers brick raised"),
+        "no change"
+    );
+    assert_eq!(
+        rewritten,
+        fs::read_to_string(&text).expect("read text result")
+    );
 }
 
 #[test]

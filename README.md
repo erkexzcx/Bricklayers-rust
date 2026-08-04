@@ -56,10 +56,10 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
 - 🛟 **Your G-code file cannot be destroyed** — output goes to a temp file, flushed to the disk
   and moved into place only once complete, keeping the original's permissions. Or use
   `--output` and never touch the input at all.
-- 🪶 **File size does not matter** — plain G-code is streamed, never loaded. Flat ~14 MB of
-  memory whether the input is 2 MB or 2 GB, where loading a 307 MB slice whole needs 1.8 GB.
-  A binary `.bgcode` container is the exception: its blocks have to be unpacked before a line
-  can be read, so the decoded G-code is held for the duration.
+- 🪶 **File size does not matter** — G-code is streamed, never loaded. Flat ~14 MB of memory
+  whether the input is 2 MB or 2 GB, where loading a 307 MB slice whole needs 1.8 GB. A binary
+  `.bgcode` container streams too, a block at a time: a 13 MB one holding a 30 MB slice goes
+  through in 4 MB of memory.
 - ⚡ **Fast** — a 31 MB, 1.2M-line slice goes through `brick` in about 150 ms.
 - ⬇️ **The nozzle always comes back down** — a raised loop returns to the layer plane before
   anything else prints, so nothing downstream inherits the shift, and no move is ever commanded
@@ -120,8 +120,6 @@ bricklayers brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode 
   staggered by the wrong amount.
 - **Spiral vase does nothing.** One continuously rising wall has no layer boundaries to
   interlock. You get a warning.
-- **A `.bgcode` file is held in memory.** Plain G-code streams; a binary container has to be
-  unpacked before a line can be read, so peak memory follows the file for those.
 
 ### Not tested at all
 
@@ -131,8 +129,9 @@ Not known to be broken. Nobody has run them.
   real slice converted to absolute mode, but no slicer here emits `M82`. In particular a tool
   change in absolute mode, where each tool keeps its own origin, has never been seen.
 - **Every slicer except OrcaSlicer.** See [above](#-slicer-support).
-- **`.bgcode` at print scale.** The decoder is pinned against Prusa's own test files; no large
-  binary file has been through it end to end.
+- **`.bgcode` as a slicer writes it at print scale.** The decoder is pinned against Prusa's own
+  test files, and a print-scale container repacked from a real slice goes through end to end,
+  but those blocks were packed by this tool rather than by PrusaSlicer.
 
 ---
 

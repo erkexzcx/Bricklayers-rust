@@ -12,9 +12,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Assets are named after the tag while the binary reports the crate version, so a
+  # mismatch ships a download called v0.0.1 that greets the user as 0.2.0.
+  verify:
+    name: Check the tag against the crate version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Compare the tag with Cargo.toml
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          crate_version="$(awk '
+            /^\[package\]/ { in_package = 1; next }
+            /^\[/          { in_package = 0 }
+            in_package && /^version[[:space:]]*=/ { gsub(/["\r]/, "", $3); print $3; exit }
+          ' Cargo.toml)"
+          [ -n "${crate_version}" ] || {
+            echo "::error::no version found in the [package] section of Cargo.toml"
+            exit 1
+          }
+          if [ "${TAG_NAME#v}" != "${crate_version}" ]; then
+            echo "::error::release tag ${TAG_NAME} does not match Cargo.toml version ${crate_version} — bump the crate or retag before publishing"
+            exit 1
+          fi
+          echo "Tag ${TAG_NAME} matches crate version ${crate_version}."
+
   prepare:
     name: Vendor dependencies
     runs-on: ubuntu-latest
+    needs: verify
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

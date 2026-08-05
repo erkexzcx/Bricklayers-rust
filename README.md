@@ -164,6 +164,10 @@ irm https://raw.githubusercontent.com/erkexzcx/Bricklayers-rust/main/deploy.ps1 
 Downloads the latest release into `~/BrickLayers` (`%USERPROFILE%\BrickLayers` on Windows),
 checks it against the published SHA-256 sums, and prints the line to paste into your slicer.
 
+**The same one-liner updates an existing install.** It always resolves the latest release and
+overwrites the binary in place, so there is nothing to uninstall first and the path you gave
+your slicer does not change. Run it again whenever you want the current version.
+
 ### 2. Download by hand
 
 Take the file for your platform from the

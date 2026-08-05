@@ -35,16 +35,16 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
 - [✨ Features](#-features)
 - [🧪 Slicer support](#-slicer-support)
 - [⚠️ Limits, and what has not been tested](#%EF%B8%8F-limits-and-what-has-not-been-tested)
-  - [Limits](#limits)
-  - [Not tested at all](#not-tested-at-all)
+  - [🚧 Limits](#-limits)
+  - [🔬 Not tested at all](#-not-tested-at-all)
 - [🚀 Install](#-install)
-  - [1. One-liner](#1-one-liner)
-  - [2. Download by hand](#2-download-by-hand)
-  - [3. Build from source](#3-build-from-source)
+  - [🪄 1. One-liner](#-1-one-liner)
+  - [📦 2. Download by hand](#-2-download-by-hand)
+  - [🔨 3. Build from source](#-3-build-from-source)
 - [🖨️ Use](#%EF%B8%8F-use)
   - [🛠️ Running it by hand](#%EF%B8%8F-running-it-by-hand)
-  - [`brick`](#brick)
-  - [Shared](#shared)
+  - [🧱 `brick`](#-brick)
+  - [🔧 Shared](#-shared)
 - [📄 Licence](#-licence)
 
 ---
@@ -53,7 +53,7 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
 
 - 🧱 **`brick`** — raises every other internal perimeter loop by half a layer height, so loop
   seams stagger and layers key into each other.
--  **Single binary, zero runtime** — no Python, no dependencies, no install ceremony. Point
+- 📦 **Single binary, zero runtime** — no Python, no dependencies, no install ceremony. Point
   your slicer at it and go.
 - 🎛️ **Every slicer, one code path** — PrusaSlicer, SuperSlicer, OrcaSlicer, Bambu Studio and
   Cura region markers are all recognised by one classifier. No slicer detection, no flags.
@@ -125,7 +125,7 @@ bricklayers brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode 
 
 ## ⚠️ Limits, and what has not been tested
 
-### Limits
+### 🚧 Limits
 
 - **Arachne interlocks less consistently than the classic wall generator.** Arachne varies a
   wall's width along its length, so the number of loops keeps changing, and every change is a
@@ -151,7 +151,7 @@ bricklayers brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode 
 - **Spiral vase does nothing.** One continuously rising wall has no layer boundaries to
   interlock. You get a warning.
 
-### Not tested at all
+### 🔬 Not tested at all
 
 Not known to be broken. Nobody has run them.
 
@@ -170,7 +170,7 @@ Not known to be broken. Nobody has run them.
 Three ways, easiest first. Each one ends the same way: a `bricklayers` binary sitting somewhere
 permanent, whose path you hand to your slicer.
 
-### 1. One-liner
+### 🪄 1. One-liner
 
 ```sh
 # Linux / macOS
@@ -187,7 +187,7 @@ checks it against the published SHA-256 sums, and prints the line to paste into 
 overwrites the binary in place, so there is nothing to uninstall first and the path you gave
 your slicer does not change. Run it again whenever you want the current version.
 
-### 2. Download by hand
+### 📦 2. Download by hand
 
 Take the file for your platform from the
 [latest release](https://github.com/erkexzcx/Bricklayers-rust/releases/latest) — Linux x86-64
@@ -205,7 +205,7 @@ If macOS refuses to run it, that is the quarantine flag your browser attaches to
 clear it, or approve the binary in System Settings → Privacy & Security. The one-liner above
 downloads with `curl`, which never sets that flag, so this only bites manual downloads.
 
-### 3. Build from source
+### 🔨 3. Build from source
 
 For any platform not listed above, or if you would rather not run someone else's binary. The
 only thing you need is [Rust](https://rustup.rs) — no C compiler, no Python, nothing else:
@@ -292,7 +292,7 @@ mainstream slicer carries everything the transform needs — the layer height an
 are read from there. Use `--layer-height` and `--wall-order` if a file has
 no settings block at all, or if what it says is read wrongly.
 
-### `brick`
+### 🧱 `brick`
 
 ```
 bricklayers brick [OPTIONS] <GCODE>
@@ -346,7 +346,7 @@ other, and numbering starts at the loop against the external perimeter — a wal
 loops at the hidden end, so numbering from there would invert the stagger every time the count
 changes. Either wall order works, and arc fitting is fine here.
 
-### Shared
+### 🔧 Shared
 
 | option | |
 |---|---|

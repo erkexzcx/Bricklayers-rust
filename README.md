@@ -48,6 +48,10 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
   sideways into whatever detail is beside it. A column climbs to its offset over the two
   layers above the bed instead, which costs the same filament and asks no bead to span more
   than a quarter of a layer beyond what your slicer metered it for.
+- 📐 **Variable and adaptive layer height** — each layer is raised by half of *its own*
+  height, measured from the file, and each raised bead is metered for the gap its own column
+  actually left. Half of one nominal height would be wrong nearly everywhere: on an adaptive
+  Benchy the layers run 0.081 to 0.119 mm while the profile still says 0.2.
 - �️ **Printing objects one at a time is understood** — a file sliced to complete each
   object before starting the next holds several first and last layers, and each one is
   treated as such: every object's bed layer is left alone and its column climbs from there,
@@ -125,9 +129,6 @@ bricklayers brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode 
   column that tall is all climb and no column, so it carries the cost with nothing above it to
   bond to. Embossed and engraved detail on a flat face is the usual case. Skipping those needs
   per-contour lookahead across layers, which the two-pass streaming design does not have.
-- **Variable / adaptive layer height gets the wrong raise.** The shift is half of *one* layer
-  height for the whole file, so any layer thinner or thicker than the commonest one is
-  staggered by the wrong amount.
 - **Spiral vase does nothing.** One continuously rising wall has no layer boundaries to
   interlock. You get a warning.
 

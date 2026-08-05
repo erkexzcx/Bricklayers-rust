@@ -59,6 +59,16 @@ Four consequences that are easy to get backwards:
    up — which is where `extrusion_multiplier` applies instead — and 0.5 where
    `capping()` forces the offset back to zero. A column capped before it
    finished climbing gives back only what it took, e.g. 0.75.
+5. **`layer_height` in that formula is the layer's OWN height, and so is the
+   one behind `rise(k-1)`.** Where a slicer varied the height, half of one
+   nominal is wrong nearly everywhere: measured on an adaptive Benchy the
+   layers run 0.0808 to 0.1186 mm while the profile still says `0.2`, and
+   raising by half of 0.2 lifted **383 of 511 layers past their own height**,
+   leaving the bead in air with a gap beneath it. `Survey::layer_heights`
+   measures each layer as `Z(k) - Z(k-1)`, which is in the past, so the
+   streaming design needs no lookahead. Note the consequence for flow: when a
+   layer thins, its column below already fills part of it, so the bead is
+   metered for the gap that is left — a 0.1 layer over a 0.2 one takes **0.5×**.
 
 ## Contour grouping — the hard part
 
@@ -143,6 +153,44 @@ adjacent. Only a single-wall region has nothing to raise.
 ## Gotchas
 
 Each of these cost a wrong answer or a shipped bug.
+
+### Variable / adaptive layer height
+
+- **Measured, never declared.** `; layer_height = 0.2` and
+  `SLIC3R_LAYER_HEIGHT` state the *setting*, not what each layer came out at.
+  On the adaptive Benchy the declared value matched **no layer in the file**.
+  Only `--layer-height` overrides a measurement; the exported nominal must not,
+  or the fix is dead in the case it exists for — a slicer post-processing hook.
+  There is **no `adaptive_layer_height` key** to grep for. The Z steps are the
+  only signal.
+- **The gate is load-bearing.** `Survey::layer_heights` is populated *only*
+  when the heights genuinely vary, so a fixed-height file takes the exact code
+  path it took before. Fixed-height files measure a spread of 3.6e-15 mm (float
+  noise from subtracting printed Z); the adaptive one spreads 0.038. Thirteen
+  orders apart, hence `SAME_HEIGHT = 0.001`. Without the gate, `shift` shifts in
+  its last bits and E words move by one in the last digit across the whole file.
+- **Exclude layer 0 and every object start from the variation test.** First
+  layer height is its own setting and is routinely thicker. Counting it makes
+  *every* stock profile look adaptive. Their heights are never read anyway —
+  `rise(0)` is 0.
+- **`(h + x) - x` is not `h` in binary** (0.2+0.1-0.1 = 0.20000000000000004).
+  The `offset == rise_below` short-circuit in `span()` is what keeps a
+  steady-state factor exactly 1.0. Do not "simplify" it away.
+- **Measuring from printed Z is correct, not a rounding bug.** Z is emitted to
+  three decimals, so a measured height can sit up to 0.001 off the slicer's own
+  `; LAYER_HEIGHT:` comment. The commanded Z is what the machine executes, so
+  the commanded difference *is* the layer. Do not switch to the comment — it is
+  a Bambu/Orca dialect and it describes intent, not motion.
+- **Orca commands Z on `G2`/`G3` arcs** (557 of them on the adaptive Benchy —
+  helical lifts). `Scan` ignores arcs for Z, which is right: they are hops. Do
+  not "fix" this without re-measuring.
+- **A file with no layer-change marker at all still gets one flat raise.**
+  `Scan` only opens a layer on a marker, so `layer_heights` stays empty and the
+  nominal is used. Verified: the same synthetic slice raises 0.050–0.100 with
+  `;LAYER:n` present and a flat 0.100 with the markers stripped. Left alone on
+  purpose — without a marker a priming lift reads as a layer, so measuring
+  heights there would feed the arithmetic garbage, and falling back is the safe
+  answer. Every mainstream slicer emits one of the three markers.
 
 ### G-code parsing
 

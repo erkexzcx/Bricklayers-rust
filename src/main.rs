@@ -70,12 +70,18 @@ fn run(cli: &Cli) -> Result<()> {
                         survey.objects()
                     );
                 }
+                if survey.variable_layers() {
+                    eprintln!(
+                        "bricklayers: the slicer varied the layer height, so each layer \
+                         is raised by half of its own"
+                    );
+                }
                 eprintln!(
-                    "bricklayers: {} layers, {} internal loops, {} raised by {:.3} mm",
+                    "bricklayers: {} layers, {} internal loops, {} raised by {}",
                     stats.layers,
                     stats.loops,
                     stats.raised,
-                    stats.layer_height / 2.0
+                    raised_by(&stats)
                 );
                 report_filament(
                     &stats,
@@ -104,11 +110,18 @@ fn resolve(
     source: &Source,
     survey: &Survey,
 ) -> brick::Config {
-    config.layer_height = detected(
-        config.layer_height,
-        slicer.layer_height,
-        source.layer_height(),
-    );
+    config.layer_height = if survey.variable_layers() {
+        // A nominal says what the slicer was asked for, not what each layer
+        // came out at, so it cannot stand in for a file that measures several
+        // heights. Only the command line overrides a measurement.
+        config.layer_height
+    } else {
+        detected(
+            config.layer_height,
+            slicer.layer_height,
+            source.layer_height(),
+        )
+    };
     // The flag wins outright rather than only being able to turn the order on:
     // detection reads slicer prose, so it can be wrong in either direction and
     // both need an escape hatch.
@@ -158,6 +171,21 @@ fn warn_layer_height(height: f64, detected: bool) {
             "bricklayers: warning: no layer height found in the file, assuming {height} mm; \
              pass --layer-height to be sure"
         );
+    }
+}
+
+/// How far loops were raised, as one figure or as the range an adaptive slice
+/// covers. A single number is what a file whose layers vary cannot honestly
+/// report, and reading one is what sends a user looking for a bug.
+fn raised_by(stats: &brick::Stats) -> String {
+    let Some((low, high)) = stats.raise else {
+        return format!("{:.3} mm", stats.layer_height / 2.0);
+    };
+    let (low, high) = (format!("{low:.3}"), format!("{high:.3}"));
+    if low == high {
+        format!("{low} mm")
+    } else {
+        format!("{low} to {high} mm")
     }
 }
 

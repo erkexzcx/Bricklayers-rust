@@ -13,6 +13,17 @@ use crate::slicer::{self, WallOrder};
 /// Layer height assumed when the file says nothing useful.
 pub const FALLBACK_LAYER_HEIGHT: f64 = 0.2;
 
+/// How far two layers' heights may differ and still count as the same, in mm.
+///
+/// Subtracting one printed Z from another leaves float noise, so a file sliced
+/// at a fixed height does not measure at exactly that height twice. Measured
+/// over three real fixed-height slices the whole spread is 3.6e-15 mm, while an
+/// adaptive slice of a Benchy spreads 0.038 mm — thirteen orders apart, so
+/// anything in between separates them. A micron is also below what a Z axis can
+/// resolve, so two layers this close are the same layer height in every sense
+/// that reaches the print.
+const SAME_HEIGHT: f64 = 0.001;
+
 /// Feedrate for an inserted Z move when the file never shows one, in mm/min.
 /// 12 mm/s is slow enough for any Z axis, including a delta moving all three
 /// towers at once.
@@ -31,6 +42,13 @@ pub struct Survey {
     pub layer_height: f64,
     /// True when the layer height came from the file rather than the fallback.
     pub layer_height_detected: bool,
+    /// Measured height of each layer, indexed from zero.
+    ///
+    /// Empty unless the slicer actually varied the height, so a file sliced at
+    /// one height is described by [`layer_height`](Self::layer_height) alone and
+    /// takes exactly the path it did before this was measured. A layer the pass
+    /// could not measure holds zero.
+    pub layer_heights: Vec<f64>,
     /// Order the file says its walls were printed in, from the configuration
     /// slicers append to the G-code. It cannot be measured from the moves
     /// themselves, so a file processed by hand has no other source.
@@ -81,6 +99,12 @@ impl Survey {
         self.object_starts.len()
     }
 
+    /// True when the slicer varied the layer height across the file, so no one
+    /// number describes it and every layer has to be raised by its own half.
+    pub fn variable_layers(&self) -> bool {
+        !self.layer_heights.is_empty()
+    }
+
     /// True when `layer` is the first of its object, whose raised loops span
     /// from the bed rather than from the layer below.
     pub fn opens_an_object(&self, layer: usize) -> bool {
@@ -121,6 +145,8 @@ struct Scan {
     /// layer marker, since a start G-code that lifts the nozzle to prime is
     /// not a layer.
     open_layer: Option<usize>,
+    /// Height measured for each layer so far, indexed by layer.
+    layer_heights: Vec<f64>,
     /// Layers at which the print went back down to start another object.
     object_starts: Vec<usize>,
     /// Last layer seen to extrude an internal perimeter, and what that stood
@@ -216,7 +242,19 @@ impl Scan {
         let (Some(index), Some(floor)) = (self.open_layer, floor) else {
             return;
         };
-        if self.previous_floor.is_some_and(|previous| floor < previous) {
+        let dropped = self.previous_floor.is_some_and(|previous| floor < previous);
+        // A layer stands on the one below it, so its own height is how far the
+        // plane rose. The first layer of an object stands on the bed instead,
+        // and a drop is what says another object just started.
+        let height = match self.previous_floor {
+            Some(previous) if !dropped => floor - previous,
+            _ => floor,
+        };
+        if self.layer_heights.len() <= index {
+            self.layer_heights.resize(index + 1, 0.0);
+        }
+        self.layer_heights[index] = height;
+        if dropped {
             self.object_starts.push(index);
             // Walls this object never reached belong to the one before it, and
             // a file with no wall at all keeps the old answer: the layer below.
@@ -224,6 +262,30 @@ impl Scan {
                 .push(self.wall_top_at_open.unwrap_or(index.saturating_sub(1)));
         }
         self.previous_floor = Some(floor);
+    }
+
+    /// The per-layer heights, but only for a file whose slicer varied them.
+    ///
+    /// A first layer is its own setting and is routinely thicker than the rest,
+    /// so it says nothing about whether the height varies — and every object
+    /// has one. Counting them would make every file look adaptive. Their
+    /// heights are never read anyway: a layer on the bed is not raised, so it
+    /// contributes nothing to itself or to the layer above.
+    fn varying_heights(&mut self) -> Vec<f64> {
+        let mut lowest = f64::INFINITY;
+        let mut highest = 0.0f64;
+        for (layer, height) in self.layer_heights.iter().enumerate() {
+            if layer == 0 || self.object_starts.contains(&layer) || !is_a_height(height) {
+                continue;
+            }
+            lowest = lowest.min(*height);
+            highest = highest.max(*height);
+        }
+        if highest - lowest > SAME_HEIGHT {
+            std::mem::take(&mut self.layer_heights)
+        } else {
+            Vec::new()
+        }
     }
 
     fn finish(mut self) -> Survey {
@@ -241,12 +303,14 @@ impl Scan {
             .max_by_key(|(_, count)| *count)
             .map(|(step, _)| *step as f64 / 1000.0);
         let layer_height = self.declared_height.filter(is_a_height).or(measured);
+        let layer_heights = self.varying_heights();
 
         Survey {
             layers: layers.max(1),
             layer_markers,
             layer_height: layer_height.unwrap_or(FALLBACK_LAYER_HEIGHT),
             layer_height_detected: layer_height.is_some(),
+            layer_heights,
             wall_order: self.wall_order,
             z_feedrate: self.z_feedrate,
             bricked: self.bricked,
@@ -350,6 +414,60 @@ mod tests {
         let survey = Survey::of("G1 Z0.2\nG1 Z0.4\nG1 Z0.6\nG1 Z1.6\n");
         assert_eq!(survey.layer_height, 0.2);
         assert!(survey.layer_height_detected);
+    }
+
+    /// Half of one height for the whole file staggers every layer that is not
+    /// that height by the wrong amount, and an adaptive slice has almost none
+    /// that are. On a real Benchy the layers ran 0.081 to 0.119 mm against a
+    /// declared 0.2, so the declared figure described no layer in the file.
+    #[test]
+    fn measures_the_height_of_each_layer_where_the_slicer_varied_it() {
+        let survey = Survey::of(
+            ";LAYER_CHANGE\nG1 Z0.2\n;LAYER_CHANGE\nG1 Z0.4\n\
+             ;LAYER_CHANGE\nG1 Z0.5\n;LAYER_CHANGE\nG1 Z0.8\n",
+        );
+        assert!(survey.variable_layers());
+        for (layer, expected) in [(0, 0.2), (1, 0.2), (2, 0.1), (3, 0.3)] {
+            let measured = survey.layer_heights[layer];
+            assert!(
+                (measured - expected).abs() < 1e-9,
+                "layer {layer} measured {measured}, not {expected}"
+            );
+        }
+    }
+
+    /// A file sliced at one height has to reach the transform exactly as it
+    /// did before layers were measured at all, so it carries no per-layer
+    /// heights for the arithmetic to pick up.
+    #[test]
+    fn a_file_sliced_at_one_height_measures_no_layers_of_its_own() {
+        let survey =
+            Survey::of(";LAYER_CHANGE\nG1 Z0.2\n;LAYER_CHANGE\nG1 Z0.4\n;LAYER_CHANGE\nG1 Z0.6\n");
+        assert!(!survey.variable_layers());
+        assert!(survey.layer_heights.is_empty());
+    }
+
+    /// A first layer is its own setting and is routinely thicker than the
+    /// rest, so counting it would make every stock profile look adaptive.
+    #[test]
+    fn a_thicker_first_layer_is_not_a_varied_height() {
+        let survey = Survey::of(
+            ";LAYER_CHANGE\nG1 Z0.3\n;LAYER_CHANGE\nG1 Z0.5\n\
+             ;LAYER_CHANGE\nG1 Z0.7\n;LAYER_CHANGE\nG1 Z0.9\n",
+        );
+        assert!(!survey.variable_layers(), "{:?}", survey.layer_heights);
+    }
+
+    /// A file that completes objects one at a time has a first layer per
+    /// object, each measured from the bed rather than from the layer below.
+    #[test]
+    fn a_second_objects_first_layer_is_not_a_varied_height() {
+        let survey = Survey::of(
+            ";LAYER_CHANGE\nG1 Z0.3\n;LAYER_CHANGE\nG1 Z0.5\n;LAYER_CHANGE\nG1 Z0.7\n\
+             ;LAYER_CHANGE\nG1 Z0.3\n;LAYER_CHANGE\nG1 Z0.5\n;LAYER_CHANGE\nG1 Z0.7\n",
+        );
+        assert_eq!(survey.objects(), 2);
+        assert!(!survey.variable_layers(), "{:?}", survey.layer_heights);
     }
 
     #[test]

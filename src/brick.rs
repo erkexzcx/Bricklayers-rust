@@ -54,7 +54,9 @@ const RAMP: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// Layer height in mm. Detected from the file when `None`.
+    /// Layer height in mm, used for every layer. `None` takes each layer's own
+    /// height from the file, which is the only right answer where the slicer
+    /// varied it.
     pub layer_height: Option<f64>,
     /// Extra extrusion for raised loops on middle layers.
     ///
@@ -94,6 +96,9 @@ pub struct Stats {
     pub layer_height: f64,
     /// False when [`Config::layer_height`] was `None` and the file gave no hint.
     pub layer_height_detected: bool,
+    /// Smallest and largest half-layer any raise was taken from, or `None`
+    /// where nothing was raised. The two differ only on an adaptive slice.
+    pub raise: Option<(f64, f64)>,
     pub layers: usize,
     pub loops: usize,
     pub raised: usize,
@@ -131,8 +136,9 @@ pub fn stream<R: BufRead, W: Write>(
     pass.out.flush()?;
 
     Ok(Stats {
-        layer_height: pass.shift * 2.0,
+        layer_height: pass.height,
         layer_height_detected: config.layer_height.is_some() || survey.layer_height_detected,
+        raise: pass.raise,
         layers: survey.layers,
         loops: pass.loops_seen,
         raised: pass.raised,
@@ -205,7 +211,13 @@ struct Pass<'a, W: Write> {
     /// over rather than where the file ends.
     object_tops: Vec<usize>,
     layer_markers: bool,
-    shift: f64,
+    /// Layer height to use where the file measured none, which is every layer
+    /// of a file sliced at a fixed height.
+    height: f64,
+    /// Height the file measured for each layer, empty unless the slicer varied
+    /// them. A raise is half of the layer it belongs to, so an adaptive slice
+    /// has as many raises as it has heights.
+    heights: Vec<f64>,
     out: W,
     extruder: Extruder,
     feature: Feature,
@@ -229,6 +241,9 @@ struct Pass<'a, W: Write> {
     travelled: bool,
     loops_seen: usize,
     raised: usize,
+    /// Smallest and largest half-layer a raise was taken from, so a report can
+    /// give a range rather than one number the file never used.
+    raise: Option<(f64, f64)>,
     filament: f64,
     raised_filament: f64,
     multiplier_filament: f64,
@@ -236,16 +251,19 @@ struct Pass<'a, W: Write> {
 
 impl<'a, W: Write> Pass<'a, W> {
     fn new(out: W, config: &'a Config, survey: &Survey) -> Self {
-        let layer_height = config
-            .layer_height
-            .filter(is_a_height)
-            .unwrap_or(survey.layer_height);
+        let uniform = config.layer_height.filter(is_a_height);
         Self {
             config,
             object_starts: survey.object_starts.clone(),
             object_tops: survey.object_tops.clone(),
             layer_markers: survey.layer_markers,
-            shift: layer_height / 2.0,
+            height: uniform.unwrap_or(survey.layer_height),
+            // A height given on the command line is the one the caller wants
+            // used, so it stands in for the measurement rather than beside it.
+            heights: match uniform {
+                Some(_) => Vec::new(),
+                None => survey.layer_heights.clone(),
+            },
             out,
             extruder: Extruder::new(),
             feature: Feature::Other,
@@ -262,6 +280,7 @@ impl<'a, W: Write> Pass<'a, W> {
             travelled: false,
             loops_seen: 0,
             raised: 0,
+            raise: None,
             filament: 0.0,
             raised_filament: 0.0,
             multiplier_filament: 0.0,
@@ -428,6 +447,11 @@ impl<'a, W: Write> Pass<'a, W> {
             self.move_z(self.layer_z + offset, raise)?;
             let factor = self.extrusion_factor(current.raised);
             if raise {
+                let half = self.height() / 2.0;
+                self.raise = Some(match self.raise {
+                    Some((low, high)) => (low.min(half), high.max(half)),
+                    None => (half, half),
+                });
                 self.meter(current.body, end, factor);
             }
             for at in current.body..end {
@@ -637,27 +661,71 @@ impl<'a, W: Write> Pass<'a, W> {
 
     /// Flow a loop's bead needs, as a multiple of what the slicer metered it
     /// for.
-    ///
-    /// A raised bead spans from the top of whatever its own column left on the
-    /// layer below up to the nozzle, so the factor is that span over the
-    /// layer's own height. It falls out at 1.0 wherever the column is neither
-    /// climbing nor being capped, and that is the only place
-    /// [`Config::extrusion_multiplier`] has anything to compensate for.
     fn extrusion_factor(&self, raised: bool) -> f64 {
         if !raised {
             return 1.0;
         }
-        if self.steady() {
-            return self.config.extrusion_multiplier;
-        }
-        let height = self.shift * 2.0;
-        (height + self.offset() - self.rise_below()) / height
+        self.span() * self.multiplier()
     }
 
-    /// How far above the layer plane a raised column stands `steps` layers
-    /// into the object it belongs to.
-    fn rise_at(&self, steps: usize) -> f64 {
-        self.shift * steps.min(RAMP) as f64 / RAMP as f64
+    /// How far a raised bead reaches, as a multiple of its own layer's height.
+    ///
+    /// It starts on top of whatever its column left on the layer below and
+    /// ends at the nozzle, so the span is this layer's height plus the ground
+    /// its offset gained over the one beneath it. Where the two offsets match
+    /// it spans exactly one layer and the arithmetic is skipped rather than
+    /// trusted: `(h + x) - x` is not `h` in binary.
+    fn span(&self) -> f64 {
+        let offset = self.offset();
+        let below = self.rise_below();
+        if offset == below {
+            return 1.0;
+        }
+        let height = self.height();
+        (height + offset - below) / height
+    }
+
+    /// [`Config::extrusion_multiplier`] where it has anything to compensate
+    /// for, which is a column standing at its full offset. A bead still
+    /// climbing, or one capping a wall, is already metered for the step it
+    /// bridges.
+    fn multiplier(&self) -> f64 {
+        if self.settled() {
+            self.config.extrusion_multiplier
+        } else {
+            1.0
+        }
+    }
+
+    /// True where a raised column has finished climbing and is not being
+    /// capped.
+    fn settled(&self) -> bool {
+        self.steps() > RAMP && !self.capping()
+    }
+
+    /// Height of the layer being printed.
+    fn height(&self) -> f64 {
+        self.height_at(self.layer)
+    }
+
+    /// What `layer` was sliced at, falling back to the one height that
+    /// describes files the slicer did not vary.
+    fn height_at(&self, layer: usize) -> f64 {
+        self.heights
+            .get(layer)
+            .copied()
+            .filter(is_a_height)
+            .unwrap_or(self.height)
+    }
+
+    /// How far a raised loop on `layer` stands above the plane once its column
+    /// has climbed for `steps` layers.
+    ///
+    /// Half of the layer's own height, so an adaptive slice staggers each
+    /// layer against the seam it actually has rather than against an average
+    /// no layer was printed at.
+    fn rise_at(&self, steps: usize, layer: usize) -> f64 {
+        self.height_at(layer) / 2.0 * steps.min(RAMP) as f64 / RAMP as f64
     }
 
     /// The offset this layer's raised loops take.
@@ -665,15 +733,16 @@ impl<'a, W: Write> Pass<'a, W> {
         if self.capping() {
             0.0
         } else {
-            self.rise_at(self.steps())
+            self.rise_at(self.steps(), self.layer)
         }
     }
 
-    /// The offset the same column was left standing at on the layer below.
+    /// The offset the same column was left standing at on the layer below,
+    /// measured from that layer's height rather than this one's.
     fn rise_below(&self) -> f64 {
         match self.steps() {
             0 => 0.0,
-            steps => self.rise_at(steps - 1),
+            steps => self.rise_at(steps - 1, self.layer - 1),
         }
     }
 
@@ -688,13 +757,6 @@ impl<'a, W: Write> Pass<'a, W> {
             .copied()
             .unwrap_or(0);
         self.layer - start
-    }
-
-    /// True where a raised column is neither climbing nor being capped, which
-    /// is the only place a bead spans exactly one layer.
-    fn steady(&self) -> bool {
-        let offset = self.offset();
-        offset > 0.0 && offset == self.rise_below()
     }
 
     /// True on a layer that tops an object's walls, which has nothing above it
@@ -717,9 +779,10 @@ impl<'a, W: Write> Pass<'a, W> {
             .filter(|delta| *delta > 0.0)
             .sum();
         self.raised_filament += stock * factor;
-        if self.steady() {
-            self.multiplier_filament += stock * (factor - 1.0);
-        }
+        // The multiplier's share is the factor less the geometry it scaled, so
+        // a layer that changed height does not book its own flow as the cost
+        // of the setting.
+        self.multiplier_filament += stock * (factor - self.span());
     }
 
     fn move_z(&mut self, z: f64, raised: bool) -> io::Result<()> {
@@ -1362,6 +1425,84 @@ mod tests {
         let out = run(&source, &Config::default());
         assert!(!out.contains("raised"), "{out}");
         assert!(!out.contains("E1.25000"), "{out}");
+    }
+
+    /// A file whose slicer varied the layer height, with `body` on a layer
+    /// half as deep as the rest of them.
+    ///
+    /// The layer under test runs 0.6 to 0.7 while every other one is 0.2, so a
+    /// raise taken from its own height cannot be confused with one taken from
+    /// the 0.2 the file declares. It sits three layers above the bed, clear of
+    /// the [`RAMP`], and carries a wall above it for the reason
+    /// [`middle_layer`] does.
+    fn varied_layers(body: &str) -> String {
+        relative(&format!(
+            "{}{}{}{}{body}{}{}",
+            layer(0.2),
+            layer(0.4),
+            layer(0.6),
+            layer(0.7),
+            layer(0.9),
+            ";TYPE:Perimeter\n\
+             G1 X0 Y0 F9000\n\
+             G1 X10 Y0 E0.5\n\
+             G1 X10 Y10 E0.5\n\
+             G1 X0 Y10 E0.5\n\
+             G1 X0 Y0 E0.5\n"
+        ))
+    }
+
+    /// Half of one layer height for the whole file staggers every layer that
+    /// is not that height by the wrong amount, and an adaptive slice has
+    /// almost none that are. Measured on a real Benchy sliced adaptively: the
+    /// layers ran 0.081 to 0.119 mm against a declared 0.2, so 383 of 511 were
+    /// lifted further than their own height and stood clear of the layer above
+    /// with a gap underneath.
+    #[test]
+    fn a_raise_is_half_of_the_layer_it_belongs_to() {
+        let source = varied_layers(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
+        let out = run(&source, &Config::default());
+        assert!(
+            out.contains("G1 Z0.750 F600 ; bricklayers brick raised"),
+            "the layer is 0.1 deep, so it takes 0.05:\n{out}"
+        );
+        assert!(
+            !out.contains("G1 Z0.800 F600 ; bricklayers brick raised"),
+            "half the declared 0.2 is a whole layer here:\n{out}"
+        );
+    }
+
+    /// A raised bead starts on top of whatever its own column left on the
+    /// layer below, so where the layer thins the column has already filled
+    /// part of it and the bead is metered for the gap that is left.
+    #[test]
+    fn a_bead_is_metered_for_the_gap_its_own_column_left() {
+        let source = varied_layers(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
+        let out = run(&source, &Config::default());
+        let raised = out
+            .lines()
+            .find(|line| line.ends_with("loop2"))
+            .map(|line| Line::parse(line).e.expect("an extrusion"))
+            .unwrap_or_else(|| panic!("loop2 missing from:\n{out}"));
+        // The column below stands 0.1 above the 0.6 plane and the nozzle is at
+        // 0.75, so the bead spans 0.05 of a layer metered for 0.1.
+        assert_eq!(raised, 0.25, "half the flow of a 0.5 bead:\n{out}");
+    }
+
+    /// A height given on the command line is the one the caller wants used, so
+    /// it stands in for the measurement rather than beside it.
+    #[test]
+    fn a_given_layer_height_overrides_what_the_layers_measure() {
+        let source = varied_layers(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
+        let config = Config {
+            layer_height: Some(0.2),
+            ..Config::default()
+        };
+        let out = run(&source, &config);
+        assert!(
+            out.contains("G1 Z0.800 F600 ; bricklayers brick raised"),
+            "{out}"
+        );
     }
 
     #[test]

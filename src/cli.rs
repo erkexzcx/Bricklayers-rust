@@ -91,7 +91,8 @@ pub struct BrickArgs {
     #[command(flatten)]
     pub common: Common,
 
-    /// Layer height in mm. Read from the file when omitted.
+    /// Layer height in mm, forced onto every layer. Measured from the file
+    /// when omitted, which is the only right answer for an adaptive slice.
     #[arg(long, value_parser = layer_height, value_name = "MM")]
     pub layer_height: Option<f64>,
 

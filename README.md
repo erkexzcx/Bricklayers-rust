@@ -30,6 +30,25 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
 
 ---
 
+## 📑 Contents
+
+- [✨ Features](#-features)
+- [🧪 Slicer support](#-slicer-support)
+- [⚠️ Limits, and what has not been tested](#%EF%B8%8F-limits-and-what-has-not-been-tested)
+  - [Limits](#limits)
+  - [Not tested at all](#not-tested-at-all)
+- [🚀 Install](#-install)
+  - [1. One-liner](#1-one-liner)
+  - [2. Download by hand](#2-download-by-hand)
+  - [3. Build from source](#3-build-from-source)
+- [🖨️ Use](#%EF%B8%8F-use)
+  - [🛠️ Running it by hand](#%EF%B8%8F-running-it-by-hand)
+  - [`brick`](#brick)
+  - [Shared](#shared)
+- [📄 Licence](#-licence)
+
+---
+
 ## ✨ Features
 
 - 🧱 **`brick`** — raises every other internal perimeter loop by half a layer height, so loop

@@ -11,6 +11,7 @@ pub mod bgcode;
 pub mod brick;
 mod error;
 pub mod feature;
+pub mod footprint;
 pub mod gcode;
 pub mod scan;
 pub mod slicer;

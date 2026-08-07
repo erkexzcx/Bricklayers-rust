@@ -83,6 +83,13 @@ fn run(cli: &Cli) -> Result<()> {
                     stats.raised,
                     raised_by(&stats)
                 );
+                if stats.capped > 0 {
+                    eprintln!(
+                        "bricklayers: {} more were left flat where the wall ends and \
+                         something is printed over it",
+                        stats.capped
+                    );
+                }
                 report_filament(
                     &stats,
                     &format!("--extrusion-multiplier {:.2}", config.extrusion_multiplier),

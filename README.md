@@ -67,6 +67,15 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
   sideways into whatever detail is beside it. A column climbs to its offset over the two
   layers above the bed instead, which costs the same filament and asks no bead to span more
   than a quarter of a layer beyond what your slicer metered it for.
+- 🧱 **A wall that stops is left flat, wherever it stops** — a shoulder, a shelf, a
+  counterbore or a screw-head recess ends one column of wall partway up while the rest of the
+  part carries on. Whatever the slicer prints over that column was metered for a full layer,
+  so a bead left standing half a layer proud fills it with about twice the material it has
+  room for. Every loop is asked whether anything stands on it a layer later, and the ones
+  that have nothing are laid on the plane and metered for the half gap they give back.
+  Measured on a bushing whose shoulder closes 3 mm up, that took 293.8 mm of a 399.0 mm top
+  surface off a raised bead — and cost between 0% and 12% of the raised loops on nine real
+  slices.
 - 📐 **Variable and adaptive layer height** — each layer is raised by half of *its own*
   height, measured from the file, and each raised bead is metered for the gap its own column
   actually left. Half of one nominal height would be wrong nearly everywhere: on an adaptive
@@ -88,7 +97,7 @@ the bed and the top layer, the two places a brick wall needs a half brick too.*
   whether the input is 2 MB or 2 GB, where loading a 307 MB slice whole needs 1.8 GB. A binary
   `.bgcode` container streams too, a block at a time: a 13 MB one holding a 30 MB slice goes
   through in 4 MB of memory.
-- ⚡ **Fast** — a 31 MB, 1.2M-line slice goes through `brick` in about 150 ms.
+- ⚡ **Fast** — a 29 MB, 1.2M-line slice goes through in about 250 ms.
 - ⬇️ **The nozzle always comes back down** — a raised loop returns to the layer plane before
   anything else prints, so nothing downstream inherits the shift, and no move is ever commanded
   below the build plate.
@@ -148,6 +157,12 @@ bricklayers brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode 
   column that tall is all climb and no column, so it carries the cost with nothing above it to
   bond to. Embossed and engraved detail on a flat face is the usual case. Skipping those needs
   per-contour lookahead across layers, which the two-pass streaming design does not have.
+- **A wall that *starts* partway up is metered as if its column were already standing.** The
+  end of a column is measured and handled; the beginning is not. A wall that begins on solid
+  infill — the underside of a shelf, the roof of a bridged hole — asks its first raised bead
+  for one layer of material where the gap is a layer and a half, so it starts under-fed. That
+  leaves a void rather than a blob, which is why it is a limit rather than a defect, but it
+  is not fixed.
 - **Spiral vase does nothing.** One continuously rising wall has no layer boundaries to
   interlock. You get a warning.
 

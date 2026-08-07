@@ -59,7 +59,18 @@ Four consequences that are easy to get backwards:
    up — which is where `extrusion_multiplier` applies instead — and 0.5 where
    `capping()` forces the offset back to zero. A column capped before it
    finished climbing gives back only what it took, e.g. 0.75.
-5. **`layer_height` in that formula is the layer's OWN height, and so is the
+5. **A column has to be capped wherever it ends, not only at the top of the
+   part.** Whatever the slicer prints over a raised bead was metered for a full
+   layer, and a bead standing half a layer proud leaves it half a gap. That is
+   only harmless where the thing above is the same column, raised too. A
+   shoulder, a shelf, a counterbore or a screw-head recess ends one column
+   partway up while the rest of the part carries on, and the surface that
+   closes it then lays about twice the material it has room for. Measured on
+   the bushing this was found on: 293.8 mm of a 399.0 mm top surface sat on a
+   bead 0.1 mm proud, 8.84 of that layer's 12.01 mm of filament going into half
+   a gap, with the fan off. Testing the object's last wall layer alone — which
+   is what `object_tops` does — caught the part's own top and nothing else.
+6. **`layer_height` in that formula is the layer's OWN height, and so is the
    one behind `rise(k-1)`.** Where a slicer varied the height, half of one
    nominal is wrong nearly everywhere: measured on an adaptive Benchy the
    layers run 0.0808 to 0.1186 mm while the profile still says `0.2`, and
@@ -153,6 +164,42 @@ adjacent. Only a single-wall region has nothing to raise.
 ## Gotchas
 
 Each of these cost a wrong answer or a shipped bug.
+
+### Is anything standing on this loop?
+
+- **The answer comes from the survey, not the rewrite.** It needs the *next*
+  layer's geometry, which a streaming rewrite cannot see. `Scan` traces each
+  layer's internal perimeters into `footprint::Cells`, keeps two layers at a
+  time, and stores only the difference — the cells of a layer that the one
+  above does not hold. That set is small by construction (it is the part's
+  ceiling area), so peak RSS stayed at 14.0 MiB on a 58 MB two-dragon slice.
+- **Cells, not points.** `CELL` is 0.3 mm, about two thirds of a bead: two
+  paths that share a cell overlap by more than half their width. The tolerance
+  is not arbitrary — measured over three real slices, 96.3 to 96.7% of wall
+  path has a wall within 0.2 mm of it on the layer above and the rest is spread
+  from 0.4 mm out to 3 mm. Anything in that window separates the two cases.
+- **Cap only a loop that has genuinely run out** (`CAP_SHARE`, 0.75). Capping
+  one whose column carries on above would leave the layer above metered against
+  a step that is no longer there, i.e. it would trade a blob for a void. The
+  per-loop distribution is close to binary anyway: 91 to 97% of loops are
+  covered almost end to end, and most of the rest are uncovered end to end.
+- **Arcs must be followed round, not cut across.** 57% of the bushing's wall
+  moves are `G2`/`G3`, and a whole ring arrives as two or three of them. Taking
+  their chords would report every ring as covering nothing and cap the lot.
+  `Line::arc()` carries `I`/`J` and the direction; `G2` is clockwise.
+- **The survey and the rewrite must agree on what extrudes.** The rewrite asks
+  about cells the survey drew, so `Scan` uses the same test the rewrite opens a
+  loop with (`delta > 0` and both `X` and `Y` present). A stricter test in the
+  survey would make loops look uncovered that are not.
+- **Verify with the physical quantity, not the internal one.** The check that
+  matters is "how much solid-infill or top-surface path is laid over a bead
+  standing half a layer proud", measured straight off the output file. On the
+  bushing it went 293.8 mm to 0.0 mm. A count of capped loops proves nothing.
+- **Cost, measured on nine real slices:** 0% to 11.5% fewer raised loops, and
+  across all of them zero moves were raised that were not raised before and no
+  commanded geometry changed. Survey throughput fell from 596 to 204 MB/s on
+  the synthetic wall-heavy bench; on real files the whole run went 152 to
+  250 ms (29 MB) and 297 to 494 ms (58 MB).
 
 ### Variable / adaptive layer height
 

@@ -7,7 +7,8 @@
 use std::io::{self, BufRead};
 
 use crate::feature::{Feature, is_layer_marker};
-use crate::gcode::{Code, Line, Lines};
+use crate::footprint::Cells;
+use crate::gcode::{Code, Extruder, Line, Lines};
 use crate::slicer::{self, WallOrder};
 
 /// Layer height assumed when the file says nothing useful.
@@ -73,6 +74,16 @@ pub struct Survey {
     /// a layer marker whose only extrusion is unlabelled. On six real slices
     /// the walls stopped one to five layers below the last.
     pub object_tops: Vec<usize>,
+    /// Where each layer's internal perimeters run with nothing above them.
+    ///
+    /// A raised bead stands half a layer proud, so whatever the slicer lays
+    /// over it at the next plane meets a gap half the size it was metered for.
+    /// That is only harmless where the thing above is the same column, raised
+    /// too. Everywhere else — a shoulder closed by a top surface, a feature
+    /// that ends, the top of the part — the bead has to be laid flat instead.
+    /// Indexed by layer, and empty for a file with no layer markers to hang
+    /// the comparison on.
+    pub uncovered: Vec<Cells>,
 }
 
 impl Survey {
@@ -120,6 +131,12 @@ impl Survey {
     pub fn closes_an_object(&self, layer: usize) -> bool {
         self.object_tops.contains(&layer)
     }
+
+    /// Where `layer`'s walls have nothing above them, or `None` where the file
+    /// gave the survey no way to tell.
+    pub fn uncovered(&self, layer: usize) -> Option<&Cells> {
+        self.uncovered.get(layer).filter(|cells| !cells.is_empty())
+    }
 }
 
 #[derive(Default)]
@@ -156,13 +173,26 @@ struct Scan {
     last_wall_layer: Option<usize>,
     wall_top_at_open: Option<usize>,
     object_tops: Vec<usize>,
+    /// Where the nozzle stands, so an extrusion can be traced from where it
+    /// began rather than from where it ended.
+    at: (f64, f64),
+    extruder: Extruder,
+    /// Cells the open layer's internal perimeters run through, and the same
+    /// for the layer below it. Only two layers are ever held: the answer for a
+    /// layer is settled as soon as the one above it has been read.
+    here: Cells,
+    below: Cells,
+    /// Index of the layer `below` describes, which is not `open_layer - 1`
+    /// when a layer holds no wall at all.
+    below_layer: Option<usize>,
+    uncovered: Vec<Cells>,
 }
 
 impl Scan {
     fn feed(&mut self, raw: &str) {
-        // One parse, and the plane is left unread: the survey only needs to
-        // know that a move went somewhere in it, never where.
-        let line = Line::scan(raw);
+        // The plane is read now: a wall has to be traced to work out what, if
+        // anything, stands on it a layer later.
+        let line = Line::parse(raw);
 
         if let Some(comment) = line.comment() {
             // A stamp rides the Z move it was written beside, so this cannot
@@ -194,21 +224,51 @@ impl Scan {
             return;
         }
 
+        match line.code {
+            Code::AbsoluteE | Code::RelativeE => self.extruder.set_mode(line.code),
+            // A `G92` moves the origin rather than the filament, so it is not
+            // an extrusion and must not be booked as one.
+            Code::SetPosition => {
+                if let Some(e) = line.e {
+                    self.extruder.set_position(e);
+                }
+            }
+            _ => {}
+        }
+        if !line.draws() {
+            return;
+        }
+
+        // A slicer names only the axes that change, so where a move starts is
+        // wherever the last one left off.
+        let from = self.at;
+        let to = (line.x.unwrap_or(from.0), line.y.unwrap_or(from.1));
+        self.at = to;
+        let delta = line.e.map_or(0.0, |e| self.extruder.observe(e));
+        // The same test the rewrite uses to open a loop, so every cell it will
+        // ask about is one this pass has already drawn.
+        let extrudes = delta > 0.0 && line.xy().is_some();
+
+        if self.feature == Feature::InternalPerimeter
+            && line.code == Code::Move
+            && line.is_xy_move()
+            && line.e.is_some_and(|e| e > 0.0)
+        {
+            self.last_wall_layer = self.open_layer;
+        }
+        if self.feature == Feature::InternalPerimeter && extrudes {
+            self.last_wall_layer = self.open_layer;
+            if self.open_layer.is_some() {
+                self.here.draw(from, to, line.arc());
+            }
+        }
+
         if line.code == Code::Arc {
             if self.feature == Feature::InternalPerimeter && line.e.is_some_and(|e| e > 0.0) {
                 self.arc_extrusions += 1;
                 self.last_wall_layer = self.open_layer;
             }
             return;
-        }
-        if line.code != Code::Move {
-            return;
-        }
-        if self.feature == Feature::InternalPerimeter
-            && line.is_xy_move()
-            && line.e.is_some_and(|e| e > 0.0)
-        {
-            self.last_wall_layer = self.open_layer;
         }
         // A move that only changes Z is the slicer driving the axis on its
         // own terms, so its feedrate is one this machine is known to accept.
@@ -235,9 +295,40 @@ impl Scan {
         }
     }
 
+    /// Settles the layer that has just been read against the one below it. A
+    /// cell of the lower layer that the upper one does not hold has nothing
+    /// standing on it, so a bead raised there would be buried under a bead
+    /// metered for a full layer.
+    fn close_footprint(&mut self) {
+        let Some(index) = self.open_layer else {
+            return;
+        };
+        self.here.settle();
+        if let Some(below) = self.below_layer {
+            let left = self.below.without(&self.here);
+            self.record(below, left);
+        }
+        // Swapped rather than handed over, so the buffer the layer below used
+        // is the one this layer fills.
+        std::mem::swap(&mut self.below, &mut self.here);
+        self.here.clear();
+        self.below_layer = Some(index);
+    }
+
+    fn record(&mut self, layer: usize, cells: Cells) {
+        if cells.is_empty() {
+            return;
+        }
+        if self.uncovered.len() <= layer {
+            self.uncovered.resize_with(layer + 1, Cells::default);
+        }
+        self.uncovered[layer] = cells;
+    }
+
     /// Finishes the layer just read. A layer lower than the one before it can
     /// only mean the nozzle went back to the bed to start another object.
     fn close_layer(&mut self) {
+        self.close_footprint();
         let floor = self.layer_floor.take();
         let (Some(index), Some(floor)) = (self.open_layer, floor) else {
             return;
@@ -290,6 +381,11 @@ impl Scan {
 
     fn finish(mut self) -> Survey {
         self.close_layer();
+        // Nothing follows the last layer, so all of its wall is uncovered.
+        if let Some(below) = self.below_layer {
+            let left = self.below.take();
+            self.record(below, left);
+        }
         let layer_markers = self.layers > 0;
         let layers = if layer_markers {
             self.layers
@@ -328,6 +424,7 @@ impl Scan {
                 tops.push(self.last_wall_layer.unwrap_or(layers.max(1) - 1));
                 tops
             },
+            uncovered: self.uncovered,
         }
     }
 }
@@ -484,6 +581,42 @@ mod tests {
              G3 X4 Y4 I1 J1 E0.5\n",
         );
         assert_eq!(survey.arc_extrusions, 2);
+    }
+
+    #[test]
+    fn finds_the_wall_that_nothing_stands_on() {
+        // Two walls 20 mm apart, only one of which carries on to the layer
+        // above. A raised bead on the other would be buried by whatever the
+        // slicer prints over it next.
+        let survey = Survey::of(
+            "M83\n\
+             ;LAYER_CHANGE\nG1 Z0.2 F600\n\
+             ;TYPE:Perimeter\n\
+             G1 X0 Y0 F9000\nG1 X10 Y0 E0.5\nG1 X10 Y10 E0.5\n\
+             G1 X30 Y0 F9000\nG1 X40 Y0 E0.5\nG1 X40 Y10 E0.5\n\
+             ;LAYER_CHANGE\nG1 Z0.4 F600\n\
+             ;TYPE:Perimeter\n\
+             G1 X0 Y0 F9000\nG1 X10 Y0 E0.5\nG1 X10 Y10 E0.5\n",
+        );
+        let cells = survey
+            .uncovered(0)
+            .expect("the wall that stops is uncovered");
+        assert!(cells.holds(35.0, 0.0), "the wall that stops");
+        assert!(!cells.holds(5.0, 0.0), "the wall that carries on");
+        // Nothing follows the last layer, so all of it is uncovered.
+        let top = survey
+            .uncovered(1)
+            .expect("nothing stands on the last layer");
+        assert!(top.holds(5.0, 0.0));
+    }
+
+    #[test]
+    fn a_file_with_no_layer_markers_reports_no_coverage_at_all() {
+        // Without a marker there is nothing to hang the comparison on, and a
+        // priming lift would read as a layer, so the answer is "do not know"
+        // rather than a guess.
+        let survey = Survey::of("M83\n;TYPE:Perimeter\nG1 X0 Y0\nG1 X10 Y0 E0.5\n");
+        assert!(survey.uncovered(0).is_none());
     }
 
     #[test]

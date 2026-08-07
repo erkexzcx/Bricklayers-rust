@@ -86,6 +86,12 @@ pub struct Line<'a> {
     pub z: Option<f64>,
     pub e: Option<f64>,
     pub f: Option<f64>,
+    /// Offsets from the start of an arc to its centre, `I` and `J`.
+    pub i: Option<f64>,
+    pub j: Option<f64>,
+    /// True for a `G2`. Which way an arc turns decides which side of the
+    /// circle it draws, so a tracer that guesses gets the complement.
+    pub clockwise: bool,
     e_span: Option<(usize, usize)>,
     comment_at: Option<usize>,
     /// An `X` or `Y` word was present, whether or not its value was read.
@@ -109,14 +115,18 @@ impl<'a> Line<'a> {
     fn read(raw: &'a str, plane: bool) -> Self {
         let comment_at = raw.find(';');
         let body = &raw[..comment_at.unwrap_or(raw.len())];
+        let (code, clockwise) = command_of(body);
         let mut line = Line {
             raw,
-            code: command_of(body),
+            code,
             x: None,
             y: None,
             z: None,
             e: None,
             f: None,
+            i: None,
+            j: None,
+            clockwise,
             e_span: None,
             comment_at,
             has_xy: false,
@@ -147,6 +157,12 @@ impl<'a> Line<'a> {
                 if !plane {
                     continue;
                 }
+            } else if matches!(letter, b'i' | b'j') {
+                // Only an arc has a centre; `I` and `J` mean other things to
+                // other commands.
+                if line.code != Code::Arc {
+                    continue;
+                }
             } else if !matches!(letter, b'z' | b'e' | b'f') || (letter == b'e' && !feeds) {
                 continue;
             }
@@ -158,6 +174,8 @@ impl<'a> Line<'a> {
                 b'y' => line.y = Some(value),
                 b'z' => line.z = Some(value),
                 b'f' => line.f = Some(value),
+                b'i' => line.i = Some(value),
+                b'j' => line.j = Some(value),
                 _ => {
                     line.e = Some(value);
                     line.e_span = Some((start, at));
@@ -183,6 +201,17 @@ impl<'a> Line<'a> {
 
     pub fn xy(&self) -> Option<(f64, f64)> {
         Some((self.x?, self.y?))
+    }
+
+    /// The arc this line draws, or `None` for anything else. `R`-form arcs are
+    /// not one: no slicer measured here emits them.
+    pub fn arc(&self) -> Option<crate::footprint::Arc> {
+        (self.code == Code::Arc).then_some(())?;
+        Some(crate::footprint::Arc {
+            i: self.i?,
+            j: self.j?,
+            clockwise: self.clockwise,
+        })
     }
 
     /// The comment text, without the leading `;`.
@@ -347,7 +376,8 @@ fn number(text: &str) -> Option<f64> {
     Some(if negative { -value } else { value })
 }
 
-fn command_of(body: &str) -> Code {
+/// The command a line carries, and whether an arc turns clockwise.
+fn command_of(body: &str) -> (Code, bool) {
     let bytes = body.as_bytes();
     let mut at = skip(bytes, 0, u8::is_ascii_whitespace);
     // Marlin's serial dialect numbers each line; the command follows it.
@@ -359,17 +389,18 @@ fn command_of(body: &str) -> Code {
     }
 
     let Some(&letter) = bytes.get(at).filter(|byte| byte.is_ascii_alphabetic()) else {
-        return Code::Other;
+        return (Code::Other, false);
     };
     let start = at + 1;
     let end = skip(bytes, start, u8::is_ascii_digit);
     match (letter | 0x20, &body[start..end]) {
-        (b'g', "0" | "1") => Code::Move,
-        (b'g', "2" | "3") => Code::Arc,
-        (b'g', "92") => Code::SetPosition,
-        (b'm', "82") => Code::AbsoluteE,
-        (b'm', "83") => Code::RelativeE,
-        _ => Code::Other,
+        (b'g', "0" | "1") => (Code::Move, false),
+        (b'g', "2") => (Code::Arc, true),
+        (b'g', "3") => (Code::Arc, false),
+        (b'g', "92") => (Code::SetPosition, false),
+        (b'm', "82") => (Code::AbsoluteE, false),
+        (b'm', "83") => (Code::RelativeE, false),
+        _ => (Code::Other, false),
     }
 }
 

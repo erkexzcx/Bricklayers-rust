@@ -66,6 +66,7 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
 |---|---|
 | `src/gcode.rs` | byte-scanner line parser (no regex), `Extruder` M82/M83 mapping, `Lines` reader |
 | `src/feature.rs` | Prusa/Orca/Bambu/Cura region markers → one enum |
+| `src/footprint.rs` | where a layer's walls sit, as grid cells, so "is anything above this loop?" is a binary search |
 | `src/scan.rs` | `Survey`: the single pre-pass |
 | `src/brick.rs` | the `brick` transform |
 | `src/slicer.rs` | `SLIC3R_*` settings the slicer exports to a post-process script |
@@ -75,6 +76,19 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
 
 ## Invariants that are easy to break
 
+- **A loop is capped wherever its column ENDS, not just at the top of the part.**
+  Whatever the slicer prints over a raised bead was metered for a full layer, so a
+  bead left half a layer proud under a shoulder, shelf or counterbore gets about
+  twice the material poured into it — it clogged a real print. `Survey.uncovered`
+  holds, per layer, the cells of that layer's walls that the layer above does not
+  cover; `brick::Pass::mark_capped` flattens a loop when more than `CAP_SHARE` of
+  its path falls in them. Do NOT lower `CAP_SHARE`: capping a loop whose column
+  carries on leaves the layer above metered against a step that is gone, trading
+  a blob for a void.
+- **Test fixtures must put a copy of the wall on the layer above.** A wall that
+  stops dead is now capped, so a fixture that ends with the body under test
+  measures a capped layer. `middle_layer` repeats the body untagged for this,
+  which means a body's loops are counted twice in `stats.loops`.
 - **G-code is not guaranteed UTF-8.** Slicers copy object and filament names into
   comments in the host's legacy encoding. Read bytes and use
   `String::from_utf8_lossy`; never `BufRead::read_line` into a `String`, which

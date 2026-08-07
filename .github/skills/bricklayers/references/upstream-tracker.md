@@ -37,7 +37,6 @@ without evidence.
 | Global last-layer test / taper on unraised loops | Needs a multi-object or capped-boss fixture |
 | Scarf seams | Both attachments are already Python-processed; needs a raw re-slice |
 | Multi-object / print-by-object | No raw fixture |
-| Stringing around Z transitions | Physical symptom, not statically detectable |
 | Line widths on reimport | Needs a slicer to observe the reported value |
 | Z-hop poisoning the layer base | 630 rises / 417 falls on a Benchy — inconclusive |
 | Trailing travel under `--reorder-loops` | Not yet exercised |
@@ -48,12 +47,34 @@ without evidence.
 
 ## Settled
 
-- **Should `--reorder-loops` default on? No.** Measured on `orig-maxwalls.gcode`
-  (3h 19m print): it removes 5490 Z-changing moves (44491 → 39001, ~110 s at the
-  file's own `F300` Z feedrate) and adds 19.1 m of travel (160.7 → 179.8 m,
-  +11.9%, ~38 s at `travel_speed = 500`). Net ~0.6% of print time, against
-  untested stringing and an untested change to how a wall's beads cool. Stays
-  off; the numbers are in the README.
+- **Stringing around Z transitions — REPRODUCED, DIAGNOSED AND FIXED, 2026-08-07.**
+  It sat under "not reproduced" as a physical symptom that could not be found
+  statically. It can: the cause is the inserted `G1 Z` itself. A Z-only move
+  names no other axis, so the planner cannot blend it with the moves on either
+  side and has to bring the toolhead to a complete stop — on the loop's start
+  point, which is the seam. `seam_position = aligned` then stacks every one of
+  those pauses into a single column of ooze.
+  - Upstream appends `f"G1 Z{...:.3f} ; Shifted Z for block #{n}\n"` (and the
+    same for the reset) for **every** perimeter block, reset blocks included,
+    with **no `F` word at all**.
+  - Measured on one real 77-layer PETG file, same input, upstream given the
+    `;TYPE:` dialect it understands: **544 inserted stops against this
+    project's 24**. On the file as OrcaSlicer actually wrote it, upstream
+    inserts **0** — it never matches `; FEATURE:`.
+  - This project's own figures before the fix: 679 stops, 67.5 mm of Z travel,
+    **13.5 s of standing still on a 12m14s print**, 145 of them landing on the
+    visible wall's start point. After: 24 stops, 0.24 s.
+  - Retraction and travel were **measured and cleared** as causes: travel is
+    identical before and after (5.76 m, 0.98 m of it un-retracted), all 132
+    bore crossings are retracted in both, and the worst change to any
+    retract/prime balance is 0.00003 mm of rounding.
+  - Confirmed on a real print: 90–95% less stringing.
+
+- **Should `--reorder-loops` default on? No — and it now buys nothing at all.**
+  It existed to pay for a Z stop once a layer instead of once a loop. Since the
+  height rides an existing travel there is no stop to pay for: on
+  `orig-maxwalls.gcode` it removes **zero** stops (1898 either way) and still
+  adds 19.1 m of travel (160.7 → 179.8 m, +11.9%). Stays off.
 
 ## Investigation debt
 

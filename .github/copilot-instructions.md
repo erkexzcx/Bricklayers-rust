@@ -76,19 +76,31 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
 
 ## Invariants that are easy to break
 
-- **A loop is capped wherever its column ENDS, not just at the top of the part.**
-  Whatever the slicer prints over a raised bead was metered for a full layer, so a
-  bead left half a layer proud under a shoulder, shelf or counterbore gets about
-  twice the material poured into it — it clogged a real print. `Survey.uncovered`
-  holds, per layer, the cells of that layer's walls that the layer above does not
-  cover; `brick::Pass::mark_capped` flattens a loop when more than `CAP_SHARE` of
-  its path falls in them. Do NOT lower `CAP_SHARE`: capping a loop whose column
+- **A loop is capped wherever its column ENDS, and climbs from wherever it
+  STARTS.** Whatever the slicer prints over a raised bead was metered for a full
+  layer, so a bead left half a layer proud under a shoulder, shelf or counterbore
+  gets about twice the material poured into it. The mirror is a column that
+  begins on solid infill: its first bead has no seam under it, so raising it by
+  the full offset asks it to span a layer and a half of gap metered for one.
+  `Survey.uncovered` holds, per layer, the cells of that layer's walls the layer
+  above does not cover; `Survey.unsupported` holds the ones the layer below does
+  not. `brick::Pass::mark_columns` walks each loop's path ONCE and tests both
+  against `CAP_SHARE`. Do NOT lower `CAP_SHARE`: capping a loop whose column
   carries on leaves the layer above metered against a step that is gone, trading
-  a blob for a void.
-- **Test fixtures must put a copy of the wall on the layer above.** A wall that
-  stops dead is now capped, so a fixture that ends with the body under test
-  measures a capped layer. `middle_layer` repeats the body untagged for this,
-  which means a body's loops are counted twice in `stats.loops`.
+  a blob for a void. Do NOT split the walk back into a pass per set — it cost
+  +28% of runtime where merged it costs +6%.
+- **A height change must never be a `G1 Z` of its own.** A Z-only move names no
+  other axis, so the planner brings the toolhead to a dead stop to run it — on
+  the loop's start point, which is the seam, with the nozzle primed. Measured on
+  a real PETG part: 679 stops, 13.5 s of standing still, and the stringing to
+  show for it. `Pass::carrier`/`ride` put the height on a move the slicer was
+  already making, and `Pass::keep` holds a tail of non-extruding lines back
+  across the `; FEATURE:` marker so a region's first loop has one to ride.
+- **Test fixtures must put a copy of the wall on the layers above AND below.** A
+  wall that stops dead is capped and a wall that starts dead climbs, so a
+  fixture whose body is the only wall in the file measures neither steady state.
+  `middle_layer` repeats the body untagged on every layer for this, which means
+  a body's loops are counted five times in `stats.loops`.
 - **G-code is not guaranteed UTF-8.** Slicers copy object and filament names into
   comments in the host's legacy encoding. Read bytes and use
   `String::from_utf8_lossy`; never `BufRead::read_line` into a `String`, which

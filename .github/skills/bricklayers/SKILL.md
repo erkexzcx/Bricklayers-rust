@@ -201,6 +201,88 @@ Each of these cost a wrong answer or a shipped bug.
   the synthetic wall-heavy bench; on real files the whole run went 152 to
   250 ms (29 MB) and 297 to 494 ms (58 MB).
 
+### How a height change reaches the machine
+
+- **A `G1 Z` of its own stops the toolhead dead.** It names no other axis, so the
+  planner cannot blend it with the moves either side, and the nozzle sits still
+  and primed over the loop's start point while the axis crawls. Every loop
+  starts at the seam, so an aligned seam stacks all of that ooze into one
+  column. Measured on a 77-layer PETG part: **679 such stops, 67.5 mm of Z
+  travel, 13.5 s of standing still on a 12m14s print**, and 145 of them landing
+  on the *visible* wall's own start point. Confirmed on a print: removing them
+  took 90–95% of the stringing away.
+- **`Pass::carrier`/`Pass::ride` put the height on a move the slicer was already
+  making.** The carrier is the last *positioning* move of the range, and it must
+  carry no `E` (an extrusion or a wipe follows the layer below and cannot be
+  tilted) and no comment (that is where the stamp goes, and `Survey::bricked`
+  needs it to refuse a second pass). Never ride a move whose own Z is above the
+  target: that is a Z-hop, and flattening one drags the nozzle through what it
+  was lifted to clear.
+- **The travel that opens a wall is emitted before the `; FEATURE:` marker**, so
+  `Pass::keep` holds a tail of non-extruding moves and comments back across the
+  marker and lets the first loop's lead reach into it. Without that tail every
+  region's first raised loop needs a stop of its own: 23 of them on the same
+  file, 1805 on a 3h print. The tail reuses `buffer`/`replay`, so the extruder's
+  observe-then-advance ordering is the one already tested; it drains on anything
+  that is not a lead line, and `TAIL` caps it so nothing larger than a region is
+  ever held.
+- **Do not measure the Z feedrate over the whole file.** `Scan` takes the
+  slowest Z-only move, which before the `open_layer` gate was the start
+  G-code's bed-clearance move on **every one of 28 real slices** — `G1 Z5 F300`
+  against an in-print F600.
+- **`--reorder-loops` now buys nothing.** It existed to pay for a stop once a
+  layer instead of once a loop; with the height riding a travel it removes zero
+  stops and still adds 19.1 m of travel.
+- Result over eighteen real slices: stops down 98% to 100% (26465 → 345,
+  13169 → 167, 679 → 0), line conservation exact on every one, audit invariant
+  0 everywhere, no bead moved, 0.52 → 0.57 s and 13.9 MiB on a 58 MB file.
+
+### A column that starts partway up
+
+- **The mirror of capping, and it was a documented limit until it was measured.**
+  A column beginning on solid infill — under a shelf, over a bridged hole — has
+  no seam beneath its first bead, so raising that bead by the full offset asks
+  it to span a layer and a half of gap the slicer metered for one. Measured
+  before the fix: **2.4% to 2.9% of internal perimeter path** across three real
+  slices.
+- **No per-column state across layers is needed, and the old note saying
+  otherwise was wrong.** `Scan::close_footprint` already holds two layers;
+  `here.without(&below)` is the mirror of the `below.without(&here)` it already
+  computes, and `Survey::unsupported` keeps it per layer. A loop is then dated
+  by testing two sets: mostly in `unsupported[layer]` means the column starts
+  here (`steps` 0), mostly in `unsupported[layer - 1]` means it started one
+  layer ago (`steps` 1), otherwise the object's own count. `RAMP` is 2, so two
+  sets are as far as the arithmetic ever looks.
+- **Walk the loop's path once, not three times.** `Pass::mark_columns` tests all
+  three sets in a single walk; doing it in separate passes cost +28% of runtime
+  where merged it costs +6%.
+- **Verify with commanded Z, move for move, against a build without it.**
+  Measured over five real slices: **zero beads lifted**, XY unchanged, 0.28% to
+  0.88% of beads lowered, and every flow change is one of four principled
+  values — 0.80 (metered for a climb it was not doing), 0.952 (raised at full
+  offset with nothing beneath), 1.19 (now correctly climbing), 2.0 (a
+  one-layer island that had been giving back half a layer it never took).
+- **Support means an internal perimeter below, and that is the right test.**
+  The question the flow asks is how far below the nozzle the surface is, and
+  that is the plane unless *this same raised column* stands there. Solid infill
+  below and nothing below give the same answer.
+
+### Stringing is not a retraction bug — this was checked
+
+A user reported stringing and blamed `--extrusion-multiplier` for desyncing
+retraction. Measured on their file and refuted:
+
+| Claim | Measurement |
+|---|---|
+| retraction is not scaled with the flow | 184 retract/prime cycles, the only imbalance is the start G-code purge and ±0.00002 of slicer rounding |
+| the multiplier over-extrudes somewhere | move-for-move `E` ratio against the input is `{1.0, 1.05, 1.25 ramp, 0.5 cap}`, max 1.2568, zero XY changes |
+| the tool changes travels | it emits none, and rewrites none |
+
+`replay` applies `delta * factor` to negative `E` too, so a retract and wipe
+inside a raised loop's range are scaled — but the prime that answers them is in
+the same range and gets the same factor, so it cancels (0.84 against 0.84). Do
+not "fix" it.
+
 ### Variable / adaptive layer height
 
 - **Measured, never declared.** `; layer_height = 0.2` and
@@ -273,6 +355,17 @@ Each of these cost a wrong answer or a shipped bug.
   violations on any input, and that zero was quoted for a whole session. Derive
   state from the G-code (nozzle Z against the last commanded Z), and **write a
   positive control that the check must flag**.
+- **A stamped travel is still a travel, and a stamped line is not the plane.**
+  Once height changes ride existing moves, `gcode.py` broke twice over in one
+  go: `regions()` skipped every stamped line before setting `travelled`, so the
+  loops either side of a ridden travel merged, and it read the layer's height
+  off the last un-stamped `G1 Z`, which is exactly the hop restore a raise now
+  gets written onto. Together they reported **1784 inversions of 5252 where the
+  truth was 951**, and a move-for-move Z comparison proved only 4444 beads of
+  1.4 million had changed at all. `planes()` now takes each layer's height as
+  the lowest Z commanded in it — a hop and a raise both only ever lift, so a
+  layer's floor is the layer. The `invariant` check was unaffected and its
+  control still fires on both forms; check both.
 - **The same trap bit `gcode.py` a second time, and it survived a year of use**
   (fixed 2026-08-03). `regions()` set `Loop.raised` from the `raised`/`reset`
   stamps. `reset` is only emitted when this tool moves Z down *itself*; at a

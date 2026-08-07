@@ -93,6 +93,7 @@ pub struct Line<'a> {
     /// circle it draws, so a tracer that guesses gets the complement.
     pub clockwise: bool,
     e_span: Option<(usize, usize)>,
+    z_span: Option<(usize, usize)>,
     comment_at: Option<usize>,
     /// An `X` or `Y` word was present, whether or not its value was read.
     has_xy: bool,
@@ -128,6 +129,7 @@ impl<'a> Line<'a> {
             j: None,
             clockwise,
             e_span: None,
+            z_span: None,
             comment_at,
             has_xy: false,
         };
@@ -172,7 +174,10 @@ impl<'a> Line<'a> {
             match letter {
                 b'x' => line.x = Some(value),
                 b'y' => line.y = Some(value),
-                b'z' => line.z = Some(value),
+                b'z' => {
+                    line.z = Some(value);
+                    line.z_span = Some((start, at));
+                }
                 b'f' => line.f = Some(value),
                 b'i' => line.i = Some(value),
                 b'j' => line.j = Some(value),
@@ -241,6 +246,26 @@ impl<'a> Line<'a> {
     /// any comment, is copied byte for byte.
     pub fn write_e<W: Write>(&self, out: &mut W, value: f64) -> io::Result<()> {
         write_e(out, self.raw, self.e_span, value)
+    }
+
+    /// Writes the line with its `Z` word set to `value`, adding one where the
+    /// line has none, and without a trailing newline so the caller can stamp
+    /// it. Everything else is copied byte for byte.
+    ///
+    /// A move the slicer was already making can carry a height change this
+    /// way, where a `G1 Z` of its own would stop the toolhead to make it.
+    pub fn write_z<W: Write>(&self, out: &mut W, value: f64) -> io::Result<()> {
+        let bytes = self.raw.as_bytes();
+        if let Some((start, end)) = self.z_span {
+            out.write_all(&bytes[..start])?;
+            write_fixed(out, value, 3)?;
+            return out.write_all(&bytes[end..]);
+        }
+        let at = self.comment_at.unwrap_or(self.raw.len());
+        out.write_all(self.raw[..at].trim_end().as_bytes())?;
+        out.write_all(b" Z")?;
+        write_fixed(out, value, 3)?;
+        out.write_all(&bytes[at..])
     }
 }
 

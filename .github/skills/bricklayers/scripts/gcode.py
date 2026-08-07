@@ -129,6 +129,34 @@ def contours(loops: list[Loop], gap: float = MAX_LOOP_GAP) -> list[list[Loop]]:
     return groups
 
 
+def planes(path: str) -> list[float | None]:
+    """The height each layer is printed at, as the lowest Z commanded in it.
+
+    A Z-hop and a raise both only ever lift the nozzle, so a layer's floor is
+    the layer. Taking the plane from the last un-stamped `G1 Z` instead breaks
+    as soon as a height change rides one: the move this tool writes a raise
+    onto is often the slicer's own hop restore, which is where the layer's
+    height was being read from.
+    """
+    found: list[float | None] = []
+    lowest = None
+    for raw in open(path, errors="replace"):
+        line = raw.strip()
+        if is_layer_change(line):
+            found.append(lowest)
+            lowest = None
+            continue
+        body = line.split(";")[0].strip()
+        # Arcs carry Z only for helical lifts, which are not the plane.
+        if body[:2] not in ("G0", "G1"):
+            continue
+        z = words(body[2:]).get("Z")
+        if z is not None and (lowest is None or z < lowest):
+            lowest = z
+    found.append(lowest)
+    return found
+
+
 def regions(path: str, kind: str = "internal"):
     """Yields `(layer, loops)` for every region of `kind` in the file.
 
@@ -136,18 +164,17 @@ def regions(path: str, kind: str = "internal"):
     the layer change merges the stray segment slicers emit before re-declaring
     a region into the previous layer, which has produced false findings before.
 
-    A loop counts as raised when the nozzle sits above the height the file
-    itself last commanded. Do NOT read that off the stamps: `reset` is only
-    emitted when this tool moves Z back down itself, so a loop raised at the
-    end of a layer stays "raised" through the slicer's own layer-change move
-    and every loop after it is mislabelled. Measured on a real 2-wall slice,
-    that leak reported 26 layers as having flipped when not one commanded Z
-    had changed.
+    A loop counts as raised when the nozzle sits above its layer's own plane.
+    Do NOT read that off the stamps: `reset` is only emitted when this tool
+    moves Z back down itself, so a loop raised at the end of a layer stays
+    "raised" through the slicer's own layer-change move and every loop after it
+    is mislabelled. Measured on a real 2-wall slice, that leak reported 26
+    layers as having flipped when not one commanded Z had changed.
     """
     layer = 0
     feature = "other"
     nozzle_z = None
-    layer_z = None
+    floors = planes(path)
     loops: list[Loop] = []
     travelled = True
 
@@ -185,19 +212,26 @@ def regions(path: str, kind: str = "internal"):
         # the region is re-declared.
         if "Z" in found_words:
             nozzle_z = found_words["Z"]
-            if not ours:
-                layer_z = nozzle_z
-        if ours or feature != kind:
-            continue
         has_xy = "X" in found_words and "Y" in found_words
+        # A travel is a travel whether or not this tool stamped a height onto
+        # it. Height changes ride the travel that reaches a loop, so skipping
+        # a stamped line outright merges the loops on either side of it and
+        # every loop after the first reads as part of its neighbour.
+        if ours:
+            if linear and has_xy:
+                travelled = True
+            continue
+        if feature != kind:
+            continue
         extrusion = found_words.get("E")
         # Arcs extrude too, and a loop that opens with one still opens there.
         if has_xy and extrusion is not None and extrusion > 0:
             if not loops or travelled:
+                floor = floors[layer] if layer < len(floors) else None
                 raised = (
                     nozzle_z is not None
-                    and layer_z is not None
-                    and nozzle_z > layer_z + 1e-6
+                    and floor is not None
+                    and nozzle_z > floor + 1e-6
                 )
                 loops.append(Loop(raised=raised))
             loops[-1].points.append((found_words["X"], found_words["Y"]))

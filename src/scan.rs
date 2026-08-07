@@ -84,6 +84,14 @@ pub struct Survey {
     /// Indexed by layer, and empty for a file with no layer markers to hang
     /// the comparison on.
     pub uncovered: Vec<Cells>,
+    /// Where each layer's internal perimeters run with nothing beneath them.
+    ///
+    /// The mirror of [`Survey::uncovered`]. A column that begins partway up —
+    /// the underside of a shelf, the roof of a bridged hole — has no seam
+    /// under its first bead, so raising that bead by the full offset asks it
+    /// to span a layer and a half of gap while the slicer metered it for one.
+    /// Indexed by layer, and empty for a file with no layer markers.
+    pub unsupported: Vec<Cells>,
 }
 
 impl Survey {
@@ -137,6 +145,14 @@ impl Survey {
     pub fn uncovered(&self, layer: usize) -> Option<&Cells> {
         self.uncovered.get(layer).filter(|cells| !cells.is_empty())
     }
+
+    /// Where `layer`'s walls have nothing beneath them, or `None` where the
+    /// file gave the survey no way to tell.
+    pub fn unsupported(&self, layer: usize) -> Option<&Cells> {
+        self.unsupported
+            .get(layer)
+            .filter(|cells| !cells.is_empty())
+    }
 }
 
 #[derive(Default)]
@@ -186,6 +202,7 @@ struct Scan {
     /// when a layer holds no wall at all.
     below_layer: Option<usize>,
     uncovered: Vec<Cells>,
+    unsupported: Vec<Cells>,
 }
 
 impl Scan {
@@ -272,7 +289,14 @@ impl Scan {
         }
         // A move that only changes Z is the slicer driving the axis on its
         // own terms, so its feedrate is one this machine is known to accept.
-        if line.z.is_some()
+        //
+        // Only once printing has begun, though. Start G-code lowers the bed
+        // and probes it at a deliberate crawl, and taking the slowest rate in
+        // the file hands that crawl to every raise in the print: measured on
+        // every real slice here, a `G1 Z5 F300` bed-clearance move set the
+        // rate where the slicer's own layer changes run at F600.
+        if self.open_layer.is_some()
+            && line.z.is_some()
             && !line.is_xy_move()
             && let Some(rate) = line.f.filter(|rate| *rate > 0.0)
         {
@@ -308,6 +332,11 @@ impl Scan {
             let left = self.below.without(&self.here);
             self.record(below, left);
         }
+        // The mirror: a cell this layer holds that the one below does not is a
+        // column starting here, whose first bead has no seam under it to sit
+        // on. At the first layer `below` is empty, so all of it starts here.
+        let fresh = self.here.without(&self.below);
+        Self::keep(&mut self.unsupported, index, fresh);
         // Swapped rather than handed over, so the buffer the layer below used
         // is the one this layer fills.
         std::mem::swap(&mut self.below, &mut self.here);
@@ -316,13 +345,17 @@ impl Scan {
     }
 
     fn record(&mut self, layer: usize, cells: Cells) {
+        Self::keep(&mut self.uncovered, layer, cells);
+    }
+
+    fn keep(into: &mut Vec<Cells>, layer: usize, cells: Cells) {
         if cells.is_empty() {
             return;
         }
-        if self.uncovered.len() <= layer {
-            self.uncovered.resize_with(layer + 1, Cells::default);
+        if into.len() <= layer {
+            into.resize_with(layer + 1, Cells::default);
         }
-        self.uncovered[layer] = cells;
+        into[layer] = cells;
     }
 
     /// Finishes the layer just read. A layer lower than the one before it can
@@ -425,6 +458,7 @@ impl Scan {
                 tops
             },
             uncovered: self.uncovered,
+            unsupported: self.unsupported,
         }
     }
 }
@@ -636,13 +670,22 @@ mod tests {
     fn takes_the_slowest_feedrate_the_file_moves_z_at() {
         // A Z-hop rides the travel rate; a layer change does not. The slower
         // of the two is the one an inserted Z move should borrow.
-        let survey = Survey::of("G1 Z0.2 F600\nG1 Z2.0 F9000\nG1 Z0.4 F720\n");
+        let survey = Survey::of(";LAYER_CHANGE\nG1 Z0.2 F600\nG1 Z2.0 F9000\nG1 Z0.4 F720\n");
+        assert_eq!(survey.z_feedrate, Some(600.0));
+    }
+
+    #[test]
+    fn ignores_the_crawl_a_start_gcode_lowers_the_bed_at() {
+        // Every real slice measured here opens with a `G1 Z5 F300`
+        // bed-clearance move, half the rate the print itself uses. Taking the
+        // slowest rate in the whole file hands that crawl to every raise.
+        let survey = Survey::of("G1 Z5 F300\n;LAYER_CHANGE\nG1 Z0.2 F600\n");
         assert_eq!(survey.z_feedrate, Some(600.0));
     }
 
     #[test]
     fn ignores_feedrates_of_moves_that_also_travel() {
-        let survey = Survey::of("G1 X1 Y1 Z0.2 F9000\n");
+        let survey = Survey::of(";LAYER_CHANGE\nG1 X1 Y1 Z0.2 F9000\n");
         assert_eq!(survey.z_feedrate, None);
     }
 

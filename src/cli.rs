@@ -110,8 +110,9 @@ pub struct BrickArgs {
     #[arg(long, value_enum, default_value_t = WallOrderArg::Auto, value_name = "ORDER")]
     pub wall_order: WallOrderArg,
 
-    /// Print each layer's unraised loops before its raised ones, so the nozzle
-    /// changes height once per layer instead of once per loop.
+    /// Print each layer's unraised loops before its raised ones, grouping them
+    /// by height instead of alternating. A height change rides a move the
+    /// slicer was already making, so this no longer saves anything.
     #[arg(long)]
     pub reorder_loops: bool,
 }

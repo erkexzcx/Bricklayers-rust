@@ -74,11 +74,40 @@ try {
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     Move-Item -Force -Path $download -Destination $binary
+    # A downloaded file keeps a mark-of-the-web stream, and the slicer launches this one without
+    # anyone watching, so a SmartScreen prompt would look like the script silently doing nothing.
+    Unblock-File -Path $binary -ErrorAction SilentlyContinue
 } finally {
     Remove-Item -Recurse -Force -Path $tmp -ErrorAction SilentlyContinue
 }
 
-$version = try { & $binary --version } catch { "bricklayers $tag" }
+$version = $null
+try {
+    $version = & $binary --version
+} catch {
+    $reason = "$_"
+    if ($reason -match 'Application Control|blocked this file') {
+        Write-Host @"
+
+Installed to $binary - but Windows refuses to start it:
+
+    $reason
+
+Smart App Control runs no program that is not signed by a certificate it already trusts, and
+these builds are unsigned. The download is not the problem: this script checked it against the
+release's published SHA-256 sum. Microsoft offers no per-app exception, and Unblock-File does
+not lift this one. Building from source does not help either - that binary is unsigned too.
+
+To allow it, open Windows Security -> App & browser control -> Smart App Control settings and
+set it to Off. If there is no such section, the block comes from an App Control policy set by
+whoever manages this PC, and only they can allow the file.
+"@
+        # Not `exit`: this script is meant to be run through `irm | iex`, where exiting closes
+        # the window on top of the explanation.
+        throw 'Windows App Control blocked bricklayers.exe - see above.'
+    }
+    $version = "bricklayers $tag"
+}
 
 Write-Host @"
 

@@ -94,8 +94,12 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
   the loop's start point, which is the seam, with the nozzle primed. Measured on
   a real PETG part: 679 stops, 13.5 s of standing still, and the stringing to
   show for it. `Pass::carrier`/`ride` put the height on a move the slicer was
-  already making, and `Pass::keep` holds a tail of non-extruding lines back
-  across the `; FEATURE:` marker so a region's first loop has one to ride.
+  already making, and `Pass::keep` holds back a tail of every line that lays no
+  bead — moves, comments AND the `M73`/`M106`/`M204`/`T`/`G92` a slicer drops
+  between the layer's `G1 Z` and the wall — across the `; FEATURE:` marker, so a
+  region's first loop has one to ride. Draining that tail on an M-code cost 2 of
+  132 raises on a stock OrcaSlicer file and all 132 once an `M73` followed every
+  layer change.
 - **Test fixtures must put a copy of the wall on the layers above AND below.** A
   wall that stops dead is capped and a wall that starts dead climbs, so a
   fixture whose body is the only wall in the file measures neither steady state.

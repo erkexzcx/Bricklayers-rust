@@ -224,6 +224,10 @@ struct Buffered {
     /// path is laid against the layer below — and so is a line that already
     /// carries a comment, which is where the stamp has to go.
     carries: bool,
+    /// True where the line is a `G92`, whose `E` is an origin rather than a
+    /// demand for filament and so reaches the output stream only when the
+    /// line is written.
+    resets_origin: bool,
 }
 
 /// One perimeter loop, as index ranges into the buffer. `lead` covers the
@@ -380,15 +384,18 @@ impl<'a, W: Write> Pass<'a, W> {
         match line.code {
             Code::AbsoluteE | Code::RelativeE => self.extruder.set_mode(line.code),
             Code::SetPosition => {
-                // A `G92` redefines the extruder origin, and the buffered
-                // region's moves have not been metered out yet: emitting them
-                // after the reset would measure their absolute positions from
-                // the wrong zero. Cura resets the origin periodically to keep
-                // `E` from growing without bound, so this is on the path the
-                // absolute-extrusion support exists for.
-                self.flush()?;
+                // A `G92` redefines the extruder origin. Loops that are still
+                // buffered may yet be reordered, so the reset has to be
+                // metered out with them rather than jumping ahead of them.
+                // A tail holds no loops and replays in the order it arrived,
+                // so the reset can travel with it — flushing there would throw
+                // away the move the next region's raise was going to ride, and
+                // Cura writes a `G92 E0` at every layer change.
+                if !self.loops.is_empty() {
+                    self.flush()?;
+                }
                 if let Some(e) = line.e {
-                    self.extruder.set_position(e);
+                    self.extruder.observe_origin(e);
                 }
             }
             _ => {}
@@ -428,14 +435,17 @@ impl<'a, W: Write> Pass<'a, W> {
     /// `; FEATURE:` marker that opens the region, so without holding it back
     /// the first loop has nothing to carry its height and needs a `G1 Z` of
     /// its own — which stops the toolhead on the loop's start point, primed,
-    /// which is the seam. Only what can sit between one region's last bead and
-    /// the next region's first is held: travels, height moves, and the
-    /// comments among them.
+    /// which is the seam. Anything that lays no bead is held, because anything
+    /// that lays no bead can sit between one region's last bead and the next
+    /// region's first — a slicer drops progress, fan, acceleration and tool
+    /// codes there freely, and ending the tail on one of those throws away the
+    /// move the raise was going to ride. Holding only travels, height moves
+    /// and comments lost the carrier for 2 of 132 raises on a stock
+    /// OrcaSlicer file, and for all 132 once an `M73` followed every layer's
+    /// `G1 Z`.
     fn keep(&mut self, raw: &str, line: Line<'_>, from: (f64, f64)) -> io::Result<()> {
         let lays = (line.x.is_some() || line.y.is_some()) && line.e.is_some();
-        let holds = self.loops.is_empty()
-            && self.buffer.len() < TAIL
-            && (line.marker().is_some() || (line.draws() && !lays));
+        let holds = self.loops.is_empty() && self.buffer.len() < TAIL && !lays;
         if holds {
             if self.buffer.is_empty() {
                 self.entry = from;
@@ -488,6 +498,7 @@ impl<'a, W: Write> Pass<'a, W> {
             extrudes,
             positions,
             carries,
+            resets_origin: line.code == Code::SetPosition,
         });
 
         if extrudes {
@@ -810,6 +821,9 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(rate) = buffered.f {
             self.feedrate = Some(rate);
         }
+        if let Some(value) = buffered.e.filter(|_| buffered.resets_origin) {
+            self.extruder.advance_origin(value);
+        }
         if let Some(delta) = buffered.delta.filter(|delta| *delta > 0.0) {
             self.filament += delta * factor;
         }
@@ -838,6 +852,11 @@ impl<'a, W: Write> Pass<'a, W> {
     }
 
     fn emit(&mut self, raw: &str, line: Line<'_>, factor: f64) -> io::Result<()> {
+        if line.code == Code::SetPosition {
+            if let Some(value) = line.e {
+                self.extruder.advance_origin(value);
+            }
+        }
         let Some(e) = line.e.filter(|_| line.draws()) else {
             return self.push(raw);
         };
@@ -1045,10 +1064,13 @@ impl<'a, W: Write> Pass<'a, W> {
         self.nozzle_z = Some(z);
         let note = if raised { "raised" } else { "reset" };
         let rate = self.z_feedrate;
-        writeln!(self.out, "G1 Z{z:.3} F{rate:.0} ; {BRICK_STAMP}{note}")?;
+        // Plain `Display`, not `{:.0}`: both rates were read off the file, and
+        // rounding them to whole mm/min hands the print back a speed it never
+        // asked for — `F0` for anything under half a unit.
+        writeln!(self.out, "G1 Z{z:.3} F{rate} ; {BRICK_STAMP}{note}")?;
         match self.feedrate {
             Some(previous) if previous != rate => {
-                writeln!(self.out, "G1 F{previous:.0} ; {BRICK_STAMP}resume")
+                writeln!(self.out, "G1 F{previous} ; {BRICK_STAMP}resume")
             }
             _ => Ok(()),
         }
@@ -1270,6 +1292,117 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("G1 F1800 ; bricklayers brick resume"), "{out}");
+    }
+
+    #[test]
+    fn an_inserted_feedrate_hands_back_the_rate_the_file_asked_for() {
+        // Rounding the restore to whole mm/min hands the print a speed it
+        // never asked for, and anything under half a unit comes back as `F0`.
+        let source = middle_layer(
+            ";TYPE:Perimeter\n\
+             G1 X0.45 Y0.45 F9000\n\
+             G1 X9.55 Y0.45 E0.5\n\
+             G1 X9.55 Y9.55 E0.5\n\
+             G1 X0.45 Y9.55 E0.5\n\
+             G1 X0.45 Y0.45 E0.5\n\
+             G1 X0 Y0 F9000 ; travel\n\
+             G1 F1799.5\n\
+             G1 X10 Y0 E0.5\n\
+             G1 X10 Y10 E0.5\n\
+             G1 X0 Y10 E0.5\n\
+             G1 X0 Y0 E0.5\n",
+        );
+        let out = run(&source, &Config::default());
+        assert!(
+            out.contains("G1 F1799.5 ; bricklayers brick resume"),
+            "the restored feedrate was rounded:\n{out}"
+        );
+    }
+
+    /// A slicer drops progress, fan, acceleration, tool and origin codes
+    /// between the layer's `G1 Z` and the wall that follows it. Ending the
+    /// held tail on one of those wrote the travel out before the raise could
+    /// ride it, so the raise fell back to a `G1 Z` of its own — on the loop's
+    /// start point, primed, which is the seam. Measured on a stock OrcaSlicer
+    /// file it cost 2 of 132 raises, and 132 of 132 once an `M73` followed
+    /// every layer's `G1 Z`.
+    #[test]
+    fn a_height_change_still_rides_a_travel_across_an_interrupting_command() {
+        for interruption in ["M73 P1 R1", "M106 S255", "M204 S500", "T0", "G92 E0"] {
+            // The loop's travel has to sit before the interruption, as it does
+            // in a real file: the slicer reaches the wall, then declares the
+            // region, and the first loop has no move of its own left.
+            let loops = wall(3, "loop");
+            let (travel, rest) = loops.split_once('\n').expect("a wall opens with a travel");
+            let body = format!("{travel}\n{interruption}\n;TYPE:Perimeter\n{rest}");
+            let same = untagged(&body);
+            let source = relative(&format!(
+                "{}{same}{}{same}{}{same}{}{body}{}{same}",
+                layer(0.2),
+                layer(0.4),
+                layer(0.6),
+                layer(0.8),
+                layer(1.0),
+            ));
+
+            let out = run(&source, &Config::default());
+            let halts = out
+                .lines()
+                .filter(|line| line.starts_with("G1 Z") && line.ends_with("raised"))
+                .count();
+            assert_eq!(halts, 0, "{interruption} cost a raise its carrier:\n{out}");
+            assert!(
+                out.contains("Z0.900 ; bricklayers brick raised"),
+                "{interruption}: nothing was raised at all:\n{out}"
+            );
+            assert!(
+                out.contains(&format!("\n{interruption}\n")),
+                "{interruption} was dropped:\n{out}"
+            );
+        }
+    }
+
+    /// The same, in absolute mode, where a `G92` also has to keep the stream
+    /// honest: the origin is read when the line is parsed but only reaches the
+    /// output when the buffered tail is written, so the two halves move apart.
+    #[test]
+    fn a_g92_between_the_layer_and_the_wall_keeps_the_carrier_and_the_origin() {
+        let loops = wall_of(3, "loop", 0.0, 10.0, 1.0);
+        let (travel, rest) = loops.split_once('\n').expect("a wall opens with a travel");
+        let body = format!("{travel}\nG92 E0\n;TYPE:Perimeter\n{rest}");
+        let same = untagged(&body);
+        let source = format!(
+            "; layer_height = 0.2\nM82\n{}{same}{}{same}{}{same}{}{body}{}{same}",
+            layer(0.2),
+            layer(0.4),
+            layer(0.6),
+            layer(0.8),
+            layer(1.0),
+        );
+
+        let out = run(&source, &Config::default());
+        let halts = out
+            .lines()
+            .filter(|line| line.starts_with("G1 Z") && line.ends_with("raised"))
+            .count();
+        assert_eq!(halts, 0, "the reset cost the raise its carrier:\n{out}");
+
+        // Every absolute value after the last reset is measured from the new
+        // zero, so none of them may jump or run backwards.
+        let after = out.rsplit_once("\nG92 E0\n").expect("the reset is kept").1;
+        let mut position = 0.0;
+        for line in after.lines() {
+            let parsed = Line::parse(line);
+            let Some(e) = parsed.e.filter(|_| parsed.draws()) else {
+                continue;
+            };
+            assert!(
+                e >= position && e - position <= 1.5,
+                "{line} asks for {} mm in one move:\n{out}",
+                e - position
+            );
+            position = e;
+        }
     }
 
     #[test]

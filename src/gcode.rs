@@ -488,6 +488,22 @@ impl Extruder {
         self.output = value;
     }
 
+    /// Applies the reset to the input stream only, at the point the `G92` is
+    /// read.
+    ///
+    /// A pass that buffers a region has not written that region out when it
+    /// parses the line, so the output stream is still behind and must not be
+    /// moved with it. See [`Extruder::advance_origin`].
+    pub fn observe_origin(&mut self, value: f64) {
+        self.input = value;
+    }
+
+    /// Applies the reset to the output stream, at the point the `G92` is
+    /// written.
+    pub fn advance_origin(&mut self, value: f64) {
+        self.output = value;
+    }
+
     /// Reads an `E` word from the input and returns the filament delta it asks
     /// for.
     pub fn observe(&mut self, value: f64) -> f64 {

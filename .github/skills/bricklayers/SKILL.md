@@ -219,13 +219,24 @@ Each of these cost a wrong answer or a shipped bug.
   target: that is a Z-hop, and flattening one drags the nozzle through what it
   was lifted to clear.
 - **The travel that opens a wall is emitted before the `; FEATURE:` marker**, so
-  `Pass::keep` holds a tail of non-extruding moves and comments back across the
-  marker and lets the first loop's lead reach into it. Without that tail every
-  region's first raised loop needs a stop of its own: 23 of them on the same
-  file, 1805 on a 3h print. The tail reuses `buffer`/`replay`, so the extruder's
-  observe-then-advance ordering is the one already tested; it drains on anything
-  that is not a lead line, and `TAIL` caps it so nothing larger than a region is
-  ever held.
+  `Pass::keep` holds a tail back across the marker and lets the first loop's lead
+  reach into it. Without that tail every region's first raised loop needs a stop
+  of its own: 23 of them on the same file, 1805 on a 3h print.
+- **The tail must hold EVERYTHING that lays no bead, not just moves and
+  comments.** A slicer drops progress, fan, acceleration, tool and origin codes
+  between the layer's `G1 Z` and the wall that follows it, and draining the tail
+  on one of those writes the travel out before the raise can ride it. Measured
+  on a stock OrcaSlicer 2.4.2 file that puts `M73` there twice: 2 of 132 raises
+  fell back to a bare `G1 Z`, and **132 of 132** once an `M73` followed every
+  layer's `G1 Z` — the same for `M106`, `M204`, `M104`, `M400`, `T0` and
+  `G92 E0`. Cura writes a `G92 E0` at every layer change, so that dialect lost
+  every raise. Holding a `G92` means its origin reset can no longer move both
+  streams at once: `observe_origin` runs when the line is read and
+  `advance_origin` when it is written. The tail reuses `buffer`/`replay`, so
+  ordering is preserved exactly — on a 70-layer file, 0 of 6638 non-move lines
+  changed position. `TAIL` (64) caps it; the longest real tail before a wall
+  measured 33 lines, on a Bambu profile with a timelapse macro. Cost: `brick`
+  went 27.6 ms to 28.6 ms on the synthetic bench, 339 to 328 MB/s.
 - **Do not measure the Z feedrate over the whole file.** `Scan` takes the
   slowest Z-only move, which before the `open_layer` gate was the start
   G-code's bed-clearance move on **every one of 28 real slices** — `G1 Z5 F300`

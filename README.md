@@ -67,15 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/erkexzcx/Bricklayers-rust/main/depl
 irm https://raw.githubusercontent.com/erkexzcx/Bricklayers-rust/main/deploy.ps1 | iex
 ```
 
-> 🛡️ **Windows: "An Application Control policy has blocked this file".** That is
-> [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003),
-> which runs no program that is not signed by a certificate it already trusts — and these
-> builds are unsigned. The download is intact: the installer checks it against the release's
-> published SHA-256 sum, and `Get-FileHash` lets you check it yourself. There is no per-app
-> exception, `Unblock-File` does not lift it, and building from source gives you another
-> unsigned binary. The way through is **Windows Security → App & browser control → Smart App
-> Control settings → Off**. No such section means the policy belongs to whoever manages the
-> PC, and only they can allow the file.
+> 🛡️ **Windows: "An Application Control policy has blocked this file".** These builds are unsigned, and [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003) blocks anything unsigned. Turn it off in **Windows Security → App & browser control → Smart App Control settings**.
 
 **By hand.** Take your platform's file from the
 [latest release](https://github.com/erkexzcx/Bricklayers-rust/releases/latest) — Linux, macOS

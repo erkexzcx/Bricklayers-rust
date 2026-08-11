@@ -33,13 +33,28 @@ The gaps are the one thing drawn far larger than life — on a 0.2 mm layer they
 
 ## ✨ Features
 
-- 🧱 **Interlocks your layers** — every other internal perimeter loop rises half a layer, so seams stagger instead of stacking. The wall you can see is never raised; it stays on the plane your slicer put it on.
-- 🎛️ **Nothing to configure** — the layer height, the line width and the nozzle are all read from your file, on every layer. One optional dial, `--extra-flow`, and nothing else.
-- 🧵 **No stringing** — a height change rides a travel the printer was already making, so the toolhead never stops over a seam with a primed nozzle.
-- 📏 **The visible wall is drawn back in** — it takes the flow like every other wall, and a bead widens about its own centre, so it is moved inward by half of what it gains and its commanded outer face stays on the coordinate your slicer chose. Arcs move too: they keep the centre they were drawn about and change radius. On an arc-fitted Benchy, 21208 of the 21396 beads of the visible wall are moved, and 185 of the 188 left are the layer on the build plate. That is the toolpath; what the plastic then measures is [its own question](#-how-much-flow-it-adds).
-- 🔬 **The awkward cases are handled** — adaptive layer height, two-wall parts and lone loops, walls that start or stop partway up, sequential objects, absolute extrusion, arc fitting.
-- 📦 **One binary, any file** — no Python and no dependencies; Linux, macOS and Windows on x86-64 and arm64; `.gcode` and `.bgcode` in and out; streamed, so a 300 MB slice costs the same 14 MB of memory as a small one.
-- 🛡️ **Your file cannot be destroyed** — written aside, then moved into place, and a second run over the same file is refused.
+- 🧱 **Layers that key into each other** — every other internal perimeter loop rises half a layer, so the seams stagger instead of lining up into one channel running through the wall.
+- 🎛️ **Nothing to fill in** — the line width and the nozzle come from your file and your slicer, and the layer height is measured off the print itself, layer by layer.
+- 🎚️ **One dial** — [`--extra-flow`](#-how-much-flow-it-adds), a percentage from `0` to `50` that is `5` if you never set it, and the only thing that changes what comes out.
+- 🔬 **Nothing to check first** — PrusaSlicer, SuperSlicer, OrcaSlicer, Bambu Studio and Cura all go through the same code path, with no slicer to pick and no dialect to declare.
+- 📦 **One binary** — Linux, macOS and Windows, x86-64 and arm64, and nothing else to install.
+- 🪶 **Any file size** — streamed rather than loaded, so a 300 MB slice costs the same 14 MB of memory as a small one.
+
+Compared to [GeekDetour/BrickLayers](https://github.com/GeekDetour/BrickLayers) and [TengerTechnologies/Bricklayers](https://github.com/TengerTechnologies/Bricklayers), both of which are Python scripts that ask you to change slicer settings before they will work, here is what you get instead:
+
+- 🐍 **No Python** — nothing to install and keep working, and no interpreter path in front of the script path in your slicer's field.
+- 🎛️ **No numbers to keep in sync** — no `-layerHeight` to match your profile and no extrusion multiplier to guess, because both are read from the file on every layer.
+- 🔧 **No slicer settings to change first** — arc fitting stays on, and your wall order is read rather than dictated.
+- 🗜️ **Binary G-code just works** — `.bgcode` is read and written natively, thumbnails and slicer config copied byte for byte, where the others need it turned off.
+- 🧵 **No stringing from the raise** — a height change rides a travel the printer was already making, instead of stopping the toolhead over a seam with a primed nozzle.
+- 🧩 **Two walls are enough** — a region with one internal loop is bricked against the wall you can see rather than skipped, so thin ribs and lone loops are interlocked too.
+- 🎨 **The visible wall is in on it** — it takes the same flow as every other wall, and is drawn back in by half of what it gains so its outer face stays exactly where your slicer drew it.
+- 🚫 **Nothing else is touched** — infill, bridges, gap fill and the top and bottom surfaces come out metered exactly as sliced, so this is never a global flow bump.
+- 🛟 **The awkward files still come out right** — adaptive layer height, absolute extrusion and objects printed one at a time are each metered for what they are.
+- ⚡ **Fast** — a 9.4 MB slice goes through both of its passes in 88 ms, so nothing waits on it.
+- 🈳 **Any character set** — the file is read as bytes, so an object or filament name in any encoding passes through untouched rather than stopping the run.
+- 🔎 **You can see what it did** — every raise is stamped into the exported G-code, so `grep bricklayers` on the file tells you it ran and where, even though a slicer swallows everything a script prints.
+- 🛡️ **Your file cannot be destroyed** — it is written aside and moved into place, and a second run over the same file is refused rather than stacking a second shift on the first.
 
 ---
 

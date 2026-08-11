@@ -133,13 +133,6 @@ fn warn_slicer_settings(slicer: &slicer::Settings) {
              rising wall, so there are no layer boundaries to interlock"
         );
     }
-    if slicer.arc_fitting == Some(true) {
-        eprintln!(
-            "bricklayers: warning: arc fitting is on; extrusions emitted as G2/G3 arcs \
-             pass through untouched"
-        );
-    }
-
     if let Some(walls) = slicer.walls
         && walls < 2
     {

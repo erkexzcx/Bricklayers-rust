@@ -25,9 +25,6 @@ pub struct Settings {
     /// Walls per region, external one included.
     pub walls: Option<u32>,
     pub spiral_vase: Option<bool>,
-    /// Arc fitting emits extrusions as `G2`/`G3`, which neither transform can
-    /// reshape.
-    pub arc_fitting: Option<bool>,
     /// Nozzle diameter in mm.
     pub nozzle: Option<f64>,
     /// Width the internal perimeters are metered at, in mm, resolved against
@@ -67,9 +64,6 @@ impl Settings {
             spiral_vase: get(&["spiral_vase", "spiral_mode"])
                 .as_deref()
                 .and_then(flag),
-            arc_fitting: get(&["arc_fitting", "enable_arc_fitting"])
-                .as_deref()
-                .map(arc_fitting),
             nozzle,
             wall_width: crate::scan::width(
                 get(&["perimeter_extrusion_width", "inner_wall_line_width"]).as_deref(),
@@ -101,12 +95,6 @@ pub(crate) fn wall_order(value: &str) -> WallOrder {
     }
 }
 
-/// PrusaSlicer's `arc_fitting` names a mode and is `disabled` when off; Orca's
-/// `enable_arc_fitting` is a flag.
-fn arc_fitting(value: &str) -> bool {
-    flag(value).unwrap_or_else(|| !value.eq_ignore_ascii_case("disabled"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,14 +124,12 @@ mod tests {
             ("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1"),
             ("SLIC3R_PERIMETERS", "3"),
             ("SLIC3R_SPIRAL_VASE", "0"),
-            ("SLIC3R_ARC_FITTING", "disabled"),
             ("SLIC3R_PP_OUTPUT_NAME", "/media/sd/part.gcode"),
         ]);
         assert_eq!(settings.layer_height, Some(0.25));
         assert_eq!(settings.wall_order, Some(WallOrder::ExternalFirst));
         assert_eq!(settings.walls, Some(3));
         assert_eq!(settings.spiral_vase, Some(false));
-        assert_eq!(settings.arc_fitting, Some(false));
         assert_eq!(
             settings.output_name.as_deref(),
             Some("/media/sd/part.gcode")
@@ -157,13 +143,11 @@ mod tests {
             ("SLIC3R_WALL_SEQUENCE", "inner wall/outer wall"),
             ("SLIC3R_WALL_LOOPS", "2"),
             ("SLIC3R_SPIRAL_MODE", "1"),
-            ("SLIC3R_ENABLE_ARC_FITTING", "1"),
         ]);
         assert_eq!(settings.layer_height, Some(0.16));
         assert_eq!(settings.wall_order, Some(WallOrder::InternalFirst));
         assert_eq!(settings.walls, Some(2));
         assert_eq!(settings.spiral_vase, Some(true));
-        assert_eq!(settings.arc_fitting, Some(true));
     }
 
     #[test]
@@ -182,11 +166,15 @@ mod tests {
         );
     }
 
+    /// Arc fitting is handled rather than warned about, so whatever mode a
+    /// slicer exports must leave the settings it does act on untouched.
     #[test]
-    fn prusaslicer_arc_modes_other_than_disabled_are_on() {
-        assert!(arc_fitting("emit_center"));
-        assert!(arc_fitting("bambu"));
-        assert!(!arc_fitting("disabled"));
+    fn arc_fitting_is_not_a_setting_this_tool_reads() {
+        let settings = read(&[
+            ("SLIC3R_ARC_FITTING", "emit_center"),
+            ("SLIC3R_ENABLE_ARC_FITTING", "1"),
+        ]);
+        assert_eq!(settings, Settings::default());
     }
 
     #[test]

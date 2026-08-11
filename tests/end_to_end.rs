@@ -789,7 +789,10 @@ fn slicer_settings_that_defeat_the_transform_are_reported() {
 
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("spiral vase"), "{report}");
-    assert!(report.contains("arc fitting"), "{report}");
+    assert!(
+        !report.contains("arc fitting"),
+        "arc fitting is handled, so it is not a setting that defeats anything: {report}"
+    );
     assert!(report.contains("1 wall(s)"), "{report}");
 }
 
@@ -837,7 +840,10 @@ fn walls_emitted_as_arcs_draw_no_warning() {
     );
     let path = sandbox.with_gcode(&arced);
 
-    let output = run(&[path.to_str().unwrap()]);
+    let output = run_with_env(
+        &[path.to_str().unwrap()],
+        &[("SLIC3R_ENABLE_ARC_FITTING", "1")],
+    );
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(!report.contains("arc"), "{report}");
@@ -854,7 +860,7 @@ fn a_well_configured_slicer_draws_no_warnings() {
             ("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1"),
             ("SLIC3R_PERIMETERS", "3"),
             ("SLIC3R_SPIRAL_VASE", "0"),
-            ("SLIC3R_ARC_FITTING", "disabled"),
+            ("SLIC3R_ARC_FITTING", "emit_center"),
         ],
     );
     assert!(output.status.success(), "{output:?}");

@@ -17,7 +17,7 @@
 
 The gaps are the one thing drawn far larger than life — on a 0.2 mm layer they are a few microns across, and at true scale you would see nothing at all. Everything else comes out of the same code the binary uses, including the two details worth knowing: the layer on the build plate is left exactly as sliced, because nothing presses a bead there, and a raised column climbs to its half layer over two layers rather than stepping up in one.
 
-> 💡 **Credit where it's due** — the idea and the research behind it belong to **Roman Tenger** and [TengerTechnologies/Bricklayers](https://github.com/TengerTechnologies/Bricklayers). Go star that repo and watch [the video](https://www.youtube.com/@TengerTechnologies) explaining why any of this works. This is a from-scratch Rust implementation, not a port.
+> 💡 **Credit where it's due** — the idea and the research behind it belong to [TengerTechnologies/Bricklayers](https://github.com/TengerTechnologies/Bricklayers) and [GeekDetour/BrickLayers](https://github.com/GeekDetour/BrickLayers).
 
 ---
 

@@ -62,7 +62,7 @@ LIGHT = Theme(
     lifted_edge="#8a5a12",
     skin="#8ec3f0",
     skin_edge="#2f6fb0",
-    seam="#d1242f",
+    seam="#9e0f1c",
 )
 
 DARK = Theme(
@@ -78,7 +78,7 @@ DARK = Theme(
     lifted_edge="#f0c26b",
     skin="#2c5f96",
     skin_edge="#8ec3f0",
-    seam="#ff7b72",
+    seam="#ff5247",
 )
 
 
@@ -291,6 +291,35 @@ that crest, and a corner deeper than the crest's flat run meets it at an angle
 and kinks the outline where it should be smooth.
 """
 
+AIR = 0.16
+"""Clear space left either side of a wall, as a share of a bead's width.
+
+Enough that a brick does not sit against the edge of its panel, and no more:
+every millimetre of it is repeated three times across the picture, so padding
+here is what makes the figure wide rather than tall.
+"""
+
+PANEL = 4.9
+"""Height of one panel's drawing area, in inches.
+
+The only size given to the figure. Its width follows from the wall's own
+aspect and the rest of the layout is measured off it, so tightening `AIR` or
+adding a layer changes the picture's proportions instead of leaving air inside
+a box of fixed size.
+"""
+
+GUTTER = 0.10
+"""Inches between two panels — a seam, not a margin."""
+
+SIDE = 0.10
+"""Inches outside the two end panels."""
+
+CROWN = 0.64
+"""Inches above the panels, for a panel title and the line under it."""
+
+FOOT = 0.08
+"""Inches below the panels. The captions are drawn inside the panels."""
+
 
 def gap_at(cfg: Wall, flow: float, staggered: bool) -> float:
     """How open a bead's corners are drawn, in mm.
@@ -400,11 +429,11 @@ def trace_layer_boundary(axes, cfg: Wall, raised: list[bool], theme: Theme) -> N
         xs,
         ys,
         color=theme.seam,
-        linewidth=2.2,
+        linewidth=2.6,
         linestyle=(0, (5, 3)),
         zorder=4,
         solid_capstyle="butt",
-        path_effects=[effects.withStroke(linewidth=3.2, foreground=theme.paper)],
+        path_effects=[effects.withStroke(linewidth=4.6, foreground=theme.paper)],
     )
 
 
@@ -437,19 +466,25 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
         ),
     ]
 
-    figure, panes = plt.subplots(1, 3, figsize=(15.0, 6.0), facecolor=theme.paper)
     # One range for all three, taken from the widest: the fed panel's innermost
     # bead reaches furthest in, and a clipped brick would read as a cut wall.
     reach = beads.bead_width(flow, spacing, cfg.height) / 2.0
+    left = face - cfg.width * AIR
+    right = (cfg.loops - 1) * spacing + reach + cfg.width * AIR
+    floor, ceiling = -cfg.height * 3.4, top + cfg.height * 1.0
+
+    # The panel is sized to the wall rather than the wall fitted into a panel,
+    # so an equal aspect leaves nothing over to pad the picture out with.
+    pane_width = PANEL * (right - left) / (ceiling - floor)
+    size = (2.0 * SIDE + 3.0 * pane_width + 2.0 * GUTTER, CROWN + PANEL + FOOT)
+    figure, panes = plt.subplots(1, 3, figsize=size, facecolor=theme.paper)
+
     for at, (axes, (shown, bricked, title, caption)) in enumerate(zip(panes, steps)):
         axes.set_facecolor(theme.paper)
         panel(axes, shown, bricked, theme)
-        axes.set_title(title, color=theme.ink, fontsize=15, pad=26, fontweight="bold")
-        axes.set_xlim(
-            face - cfg.width * 0.6,
-            (cfg.loops - 1) * spacing + reach + cfg.width * 0.6,
-        )
-        axes.set_ylim(-cfg.height * 3.4, top + cfg.height * 1.0)
+        axes.set_title(title, color=theme.ink, fontsize=15, pad=18, fontweight="bold")
+        axes.set_xlim(left, right)
+        axes.set_ylim(floor, ceiling)
         axes.set_aspect("equal")
         axes.axis("off")
 
@@ -475,17 +510,19 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
             linestyle=(0, (2, 3)),
             zorder=0,
         )
+        # Anchored on its left, not centred: the face is the panel's left edge,
+        # so a centred label hangs half of itself outside the figure.
         axes.text(
-            face,
+            face + cfg.width * AIR / 3.0,
             -cfg.height * 1.15,
             "outer face",
             color=theme.faint,
             fontsize=9.5,
-            ha="center",
+            ha="left",
             va="center",
         )
         axes.text(
-            ((cfg.loops - 1) * spacing + face) / 2.0,
+            (left + right) / 2.0,
             -cfg.height * 2.35,
             caption,
             ha="center",
@@ -497,16 +534,23 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
 
     # Nothing is written under the panels: README.md carries the explanation,
     # where it can be read at any width and searched.
-    figure.subplots_adjust(left=0.01, right=0.99, top=0.87, bottom=0.04, wspace=0.02)
+    edge, foot = SIDE / size[0], FOOT / size[1]
+    figure.subplots_adjust(
+        left=edge,
+        right=1.0 - edge,
+        top=1.0 - CROWN / size[1],
+        bottom=foot,
+        wspace=GUTTER / pane_width,
+    )
 
     # The third panel is the tool's actual output; the first two are how it got
     # there.
     box = panes[2].get_position()
     figure.add_artist(
         FancyBboxPatch(
-            (box.x0 - 0.004, 0.022),
-            box.width + 0.008,
-            0.966,
+            (box.x0 - edge / 3.0, foot / 2.0),
+            box.width + 2.0 * edge / 3.0,
+            1.0 - foot,
             boxstyle="round,pad=0,rounding_size=0.012",
             transform=figure.transFigure,
             facecolor=theme.highlight,
@@ -524,7 +568,7 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
     plate = figure.transFigure.inverted().transform(panes[0].transData.transform((0.0, 0.0)))[1]
     figure.add_artist(
         Line2D(
-            [0.014, 0.986],
+            [edge / 2.0, 1.0 - edge / 2.0],
             [plate, plate],
             transform=figure.transFigure,
             color=theme.faint,
@@ -534,7 +578,7 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
         )
     )
     figure.text(
-        0.984,
+        1.0 - 1.5 * edge,
         plate - 0.008,
         "heated bed",
         ha="right",
@@ -553,7 +597,7 @@ def main() -> None:
     parse = argparse.ArgumentParser(description=__doc__)
     parse.add_argument("--output-dir", type=Path, default=Path("."))
     parse.add_argument("--stem", default="interlock")
-    parse.add_argument("--layers", type=int, default=8)
+    parse.add_argument("--layers", type=int, default=10)
     parse.add_argument("--loops", type=int, default=5)
     parse.add_argument("--height", type=float, default=beads.REFERENCE_HEIGHT)
     parse.add_argument("--width", type=float, default=beads.REFERENCE_WIDTH)

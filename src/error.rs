@@ -16,13 +16,10 @@ pub enum Error {
     Bgcode { path: PathBuf, reason: String },
 
     #[error(
-        "{path} already carries {transform} marks; running {transform} again would stack \
-         a second shift on the first. Re-slice, or pass --force if that is what you want"
+        "{path} has already been bricked; running again would stack a second shift on \
+         the first. Re-slice, or pass --force if that is what you want"
     )]
-    AlreadyProcessed {
-        path: PathBuf,
-        transform: &'static str,
-    },
+    AlreadyProcessed { path: PathBuf },
 }
 
 impl Error {

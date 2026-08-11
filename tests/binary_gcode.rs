@@ -50,6 +50,41 @@ fn run(args: &[&str]) -> std::process::Output {
     Command::new(BIN).args(args).output().expect("run binary")
 }
 
+/// Runs the binary with the layer height a slicer would have exported.
+///
+/// A container states its own layer height in a metadata block and the G-code
+/// it carries does not, so comparing the two paths means handing the text one
+/// the same figure. Otherwise the comparison is of what each could work the
+/// height out from rather than of what each did with it.
+fn run_at_layer_height(args: &[&str]) -> std::process::Output {
+    Command::new(BIN)
+        .args(args)
+        .env("SLIC3R_LAYER_HEIGHT", "0.2")
+        .output()
+        .expect("run binary")
+}
+
+/// The whole point of reading the container's metadata: a binary file gets its
+/// flow from its own geometry, not from the fallback, even though nothing in
+/// its G-code stream states a width. Nothing is passed on the command line,
+/// because nothing can be.
+#[test]
+fn a_binary_file_gets_its_flow_from_its_own_metadata() {
+    let sandbox = Sandbox::new("binary-flow");
+    let path = sandbox.with("cube.bgcode", SINGLE);
+    let output = run(&["--verbose", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(report.contains("binary G-code container"), "{report}");
+    assert!(
+        !report.contains("states no internal wall width"),
+        "the container states one, so nothing may fall back: {report}"
+    );
+    // 0.2 mm layers at a 0.45 mm wall, both out of the metadata blocks.
+    assert!(report.contains("a flow of 1.025"), "{report}");
+}
+
 /// The G-code a [`Source`] hands a transform, however it is packed.
 fn streamed(path: &Path) -> String {
     let source = Source::open(path).expect("open source");
@@ -115,6 +150,21 @@ fn decodes_real_prusaslicer_files() {
     }
 }
 
+/// The geometry the flow is derived from is in the metadata of a binary file
+/// and nowhere in its G-code, so a search of the decoded stream finds none of
+/// it. The two are read together because a profile may state the width as a
+/// share of the nozzle, and the nozzle can arrive a block later; these two
+/// state it as a length.
+#[test]
+fn reads_the_geometry_the_flow_is_derived_from() {
+    for (label, bytes) in [("single block", SINGLE), ("ten blocks", MULTI)] {
+        let (container, gcode) = bgcode::parse(bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(container.nozzle, Some(0.4), "{label}");
+        assert_eq!(container.wall_width, Some(0.45), "{label}");
+        assert!(!gcode.contains("perimeter_extrusion_width"), "{label}");
+    }
+}
+
 #[test]
 fn plain_text_is_left_to_the_text_path() {
     assert!(!bgcode::is_binary(b"G1 X1 Y1 E1\n"));
@@ -126,7 +176,7 @@ fn a_truncated_file_fails_with_a_readable_message() {
     let sandbox = Sandbox::new("truncated");
     let path = sandbox.with("part.bgcode", &SINGLE[..SINGLE.len() / 2]);
 
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -145,7 +195,7 @@ fn a_corrupted_block_is_rejected() {
     *damaged.last_mut().unwrap() ^= 0xFF;
     let path = sandbox.with("part.bgcode", &damaged);
 
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("checksum"));
 
@@ -163,7 +213,7 @@ fn brick_rewrites_binary_gcode_in_place() {
     let (container, _) = bgcode::parse(SINGLE).expect("fixture should parse");
     let path = sandbox.with("part.bgcode", &container.serialize(&brickable_gcode(3)));
 
-    let output = run(&["brick", "--verbose", path.to_str().unwrap()]);
+    let output = run(&["--verbose", path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let written = fs::read(&path).expect("read result");
@@ -187,7 +237,7 @@ fn the_binary_path_matches_the_text_path() {
     let binary = sandbox.with("part.bgcode", SINGLE);
 
     for path in [&text, &binary] {
-        let output = run(&["brick", "--layer-height", "0.2", path.to_str().unwrap()]);
+        let output = run_at_layer_height(&[path.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
     }
 
@@ -210,7 +260,7 @@ fn a_rewrite_across_many_blocks_matches_the_text_path() {
     let binary = sandbox.with("part.bgcode", &container.serialize(&gcode));
 
     for path in [&text, &binary] {
-        let output = run(&["brick", "--layer-height", "0.2", path.to_str().unwrap()]);
+        let output = run_at_layer_height(&[path.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
     }
 
@@ -230,7 +280,7 @@ fn rewriting_preserves_metadata_blocks_untouched() {
     let sandbox = Sandbox::new("metadata");
     let path = sandbox.with("part.bgcode", SINGLE);
 
-    assert!(run(&["brick", path.to_str().unwrap()]).status.success());
+    assert!(run(&[path.to_str().unwrap()]).status.success());
     let written = fs::read(&path).expect("read result");
 
     let shared = written

@@ -100,8 +100,9 @@ Installed ${version} to ${binary}
 Add this to your slicer — PrusaSlicer: Print Settings -> Output options -> Post-processing
 scripts, Orca/Bambu Studio: Others -> Post-processing Scripts:
 
-    ${binary} brick --extrusion-multiplier 1.05
+    ${binary}
 
-The slicer appends the G-code path itself. Bricking needs two walls or more; three or more
-interlocks twice as much. Run '${binary} brick --help' for the options.
+The slicer appends the G-code path itself. Nothing else needs setting: the layer height, the
+line width and the flow are all read from the file. Bricking needs two walls or more; three or
+more interlocks twice as much. Run '${binary} --help' for the options.
 EOF

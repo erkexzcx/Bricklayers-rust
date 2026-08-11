@@ -54,6 +54,19 @@ pub struct Survey {
     /// slicers append to the G-code. It cannot be measured from the moves
     /// themselves, so a file processed by hand has no other source.
     pub wall_order: Option<WallOrder>,
+    /// Width the external perimeter was metered at, in mm, from the file's own
+    /// settings block. `None` where the file states none.
+    pub skin_width: Option<f64>,
+    /// Width the internal perimeters were metered at, in mm, from the file's
+    /// own settings block.
+    ///
+    /// It is what sets how far apart the slicer laid neighbouring beads, and
+    /// so how much of each bead sits in the corner between two of them, which
+    /// is what the flow the walls are metered at is derived from.
+    pub wall_width: Option<f64>,
+    /// Nozzle diameter in mm, which is what a width stated as a percentage is
+    /// a percentage of.
+    pub nozzle: Option<f64>,
     /// Slowest feedrate the file itself uses to move Z alone, in mm/min.
     pub z_feedrate: Option<f64>,
     /// True when [`brick`](crate::brick) has already run over this file.
@@ -160,6 +173,12 @@ struct Scan {
     layers: usize,
     declared_height: Option<f64>,
     wall_order: Option<WallOrder>,
+    /// Widths exactly as the settings block stated them, since a percentage
+    /// only becomes a length once the nozzle has been read, and the nozzle can
+    /// be stated after them.
+    skin_width: Option<String>,
+    wall_width: Option<String>,
+    nozzle: Option<String>,
     /// Distinct upward Z steps and how often each was seen, so the commonest
     /// one can stand in for a layer height the file never states.
     z_steps: Vec<(i64, usize)>,
@@ -232,6 +251,12 @@ impl Scan {
                     if let Ok(height) = value.parse() {
                         self.declared_height.get_or_insert(height);
                     }
+                } else if is_skin_width(key) {
+                    self.skin_width.get_or_insert_with(|| value.to_owned());
+                } else if is_wall_width(key) {
+                    self.wall_width.get_or_insert_with(|| value.to_owned());
+                } else if key.eq_ignore_ascii_case("nozzle_diameter") {
+                    self.nozzle.get_or_insert_with(|| value.to_owned());
                 } else if key.eq_ignore_ascii_case("wall_sequence")
                     || key.eq_ignore_ascii_case("external_perimeters_first")
                 {
@@ -433,6 +458,7 @@ impl Scan {
             .map(|(step, _)| *step as f64 / 1000.0);
         let layer_height = self.declared_height.filter(is_a_height).or(measured);
         let layer_heights = self.varying_heights();
+        let nozzle = width(self.nozzle.as_deref(), None);
 
         Survey {
             layers: layers.max(1),
@@ -441,6 +467,9 @@ impl Scan {
             layer_height_detected: layer_height.is_some(),
             layer_heights,
             wall_order: self.wall_order,
+            skin_width: width(self.skin_width.as_deref(), nozzle),
+            wall_width: width(self.wall_width.as_deref(), nozzle),
+            nozzle,
             z_feedrate: self.z_feedrate,
             bricked: self.bricked,
             arc_extrusions: self.arc_extrusions,
@@ -471,6 +500,42 @@ fn setting(comment: &str) -> Option<(&str, &str)> {
     Some((key.trim(), value.trim()))
 }
 
+/// Settings keys naming the width the visible wall is metered at, across the
+/// slicers that state one: `external_perimeter_extrusion_width` (PrusaSlicer
+/// and SuperSlicer) and `outer_wall_line_width` (OrcaSlicer and Bambu Studio).
+fn is_skin_width(key: &str) -> bool {
+    [
+        "external_perimeter_extrusion_width",
+        "outer_wall_line_width",
+    ]
+    .iter()
+    .any(|known| key.eq_ignore_ascii_case(known))
+}
+
+/// Settings keys naming the width the hidden walls are metered at:
+/// `perimeter_extrusion_width` (PrusaSlicer and SuperSlicer) and
+/// `inner_wall_line_width` (OrcaSlicer and Bambu Studio). Matched whole, so
+/// the external wall's own key is not one of them.
+fn is_wall_width(key: &str) -> bool {
+    ["perimeter_extrusion_width", "inner_wall_line_width"]
+        .iter()
+        .any(|known| key.eq_ignore_ascii_case(known))
+}
+
+/// A width from a settings block, in mm.
+///
+/// Slicers state one either as a length or as a percentage of the nozzle, and
+/// a profile covering several extruders states one value per extruder. A
+/// percentage without a nozzle to measure it against is no width at all.
+pub(crate) fn width(stated: Option<&str>, nozzle: Option<f64>) -> Option<f64> {
+    let first = stated?.split(',').next()?.trim();
+    let width = match first.strip_suffix('%') {
+        Some(share) => share.trim().parse::<f64>().ok()? / 100.0 * nozzle?,
+        None => first.parse().ok()?,
+    };
+    Some(width).filter(is_a_height)
+}
+
 /// Rejects the values a broken settings line can still parse as a number.
 pub(crate) fn is_a_height(height: &f64) -> bool {
     height.is_finite() && *height > 0.0
@@ -491,6 +556,76 @@ mod tests {
     fn ignores_related_settings_keys() {
         let survey = Survey::of("; first_layer_height = 0.3\n; layer_height = 0.15\n");
         assert_eq!(survey.layer_height, 0.15);
+    }
+
+    /// The width the visible wall was metered at is what turns a flow
+    /// multiplier into a distance to draw that wall in by.
+    #[test]
+    fn reads_the_width_the_visible_wall_was_metered_at() {
+        for stated in [
+            "; external_perimeter_extrusion_width = 0.45",
+            "; outer_wall_line_width = 0.45",
+        ] {
+            assert_eq!(Survey::of(stated).skin_width, Some(0.45), "{stated}");
+        }
+    }
+
+    /// A percentage is of the nozzle, so it is a width once the file states
+    /// one and nothing at all before that.
+    #[test]
+    fn a_width_stated_as_a_share_of_the_nozzle_needs_the_nozzle() {
+        assert_eq!(
+            Survey::of("; external_perimeter_extrusion_width = 105%").skin_width,
+            None
+        );
+        let survey = Survey::of(
+            "; nozzle_diameter = 0.4\n\
+             ; external_perimeter_extrusion_width = 105%\n\
+             ; perimeter_extrusion_width = 112.5%\n",
+        );
+        assert_eq!(survey.nozzle, Some(0.4));
+        let close = |got: Option<f64>, want: f64| got.is_some_and(|got| (got - want).abs() < 1e-9);
+        assert!(close(survey.skin_width, 0.42), "{:?}", survey.skin_width);
+        assert!(close(survey.wall_width, 0.45), "{:?}", survey.wall_width);
+    }
+
+    /// The width the hidden walls were metered at is what sets the spacing
+    /// their beads were laid at, which is what the flow is derived from.
+    #[test]
+    fn reads_the_width_the_hidden_walls_were_metered_at() {
+        for stated in [
+            "; perimeter_extrusion_width = 0.45",
+            "; inner_wall_line_width = 0.45",
+        ] {
+            assert_eq!(Survey::of(stated).wall_width, Some(0.45), "{stated}");
+        }
+        // The visible wall's own width is a different setting.
+        assert_eq!(
+            Survey::of("; external_perimeter_extrusion_width = 0.42").wall_width,
+            None
+        );
+    }
+
+    /// A profile covering several extruders states one value per extruder, and
+    /// the first is the one this reads.
+    #[test]
+    fn a_setting_stated_once_per_extruder_reads_as_its_first_value() {
+        let survey = Survey::of("; nozzle_diameter = 0.4,0.6\n; inner_wall_line_width = 0.45,0.6");
+        assert_eq!(survey.nozzle, Some(0.4));
+        assert_eq!(survey.wall_width, Some(0.45));
+    }
+
+    /// A width that is not a length is no better than a missing one.
+    #[test]
+    fn a_wall_width_that_is_not_a_length_is_ignored() {
+        for ignored in [
+            "; external_perimeter_extrusion_width = 0",
+            "; external_perimeter_extrusion_width = -0.45",
+            "; external_perimeter_extrusion_width = wide",
+            "; nozzle_diameter = 0.4\n; external_perimeter_extrusion_width = -105%",
+        ] {
+            assert_eq!(Survey::of(ignored).skin_width, None, "{ignored}");
+        }
     }
 
     /// Wall order cannot be measured from the moves — marker transitions come

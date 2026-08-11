@@ -6,7 +6,7 @@ use bricklayers::scan::Survey;
 use bricklayers::slicer::{self, WallOrder};
 use bricklayers::{Error, Result, Source, brick};
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::Cli;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -20,13 +20,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    let common = cli.command.common();
     let slicer = slicer::Settings::from_env();
-    let source = Source::open(&common.input)?;
+    let source = Source::open(&cli.input)?;
 
     warn_slicer_settings(&slicer);
-
-    if common.verbose {
+    if cli.verbose {
         if source.is_binary() {
             eprintln!("bricklayers: binary G-code container");
         }
@@ -36,83 +34,74 @@ fn run(cli: &Cli) -> Result<()> {
     }
 
     let survey = source.survey()?;
-    if let Some(transform) = repeated(&cli.command, &survey)
-        && !common.force
-    {
+    if survey.bricked && !cli.force {
         return Err(Error::AlreadyProcessed {
-            path: common.input.clone(),
-            transform,
+            path: cli.input.clone(),
         });
     }
 
-    let sink = source.sink(common.output.as_ref().unwrap_or(&common.input))?;
+    let sink = source.sink(cli.output.as_ref().unwrap_or(&cli.input))?;
+    let config = resolve(
+        brick::Config {
+            // The flag is a percentage; everything inside is a fraction.
+            extra_flow: cli.extra_flow / 100.0,
+            ..brick::Config::default()
+        },
+        &slicer,
+        &source,
+        &survey,
+    );
 
-    match &cli.command {
-        Command::Brick(args) => {
-            let config = resolve(
-                args.into(),
-                args.wall_order.chosen(),
-                &slicer,
-                &source,
-                &survey,
+    let stats = source.rewrite(sink, |reader, writer| {
+        brick::stream(reader, writer, &config, &survey)
+    })?;
+
+    warn_layer_height(stats.layer_height, stats.layer_height_detected);
+    warn_step(&stats, slicer.nozzle.or(survey.nozzle).or(source.nozzle()));
+    if cli.verbose {
+        if survey.objects() > 1 {
+            eprintln!(
+                "bricklayers: {} objects printed one after another, each built \
+                 from the bed up",
+                survey.objects()
             );
-
-            let stats = source.rewrite(sink, |reader, writer| {
-                brick::stream(reader, writer, &config, &survey)
-            })?;
-
-            warn_layer_height(stats.layer_height, stats.layer_height_detected);
-            if common.verbose {
-                if survey.objects() > 1 {
-                    eprintln!(
-                        "bricklayers: {} objects printed one after another, each built \
-                         from the bed up",
-                        survey.objects()
-                    );
-                }
-                if survey.variable_layers() {
-                    eprintln!(
-                        "bricklayers: the slicer varied the layer height, so each layer \
-                         is raised by half of its own"
-                    );
-                }
-                eprintln!(
-                    "bricklayers: {} layers, {} internal loops, {} raised by {}",
-                    stats.layers,
-                    stats.loops,
-                    stats.raised,
-                    raised_by(&stats)
-                );
-                if stats.capped > 0 {
-                    eprintln!(
-                        "bricklayers: {} more were left flat where the wall ends and \
-                         something is printed over it",
-                        stats.capped
-                    );
-                }
-                report_filament(
-                    &stats,
-                    &format!("--extrusion-multiplier {:.2}", config.extrusion_multiplier),
-                );
-            }
         }
+        if survey.variable_layers() {
+            eprintln!(
+                "bricklayers: the slicer varied the layer height, so each layer \
+                 is raised by half of its own"
+            );
+        }
+        eprintln!(
+            "bricklayers: {} layers, {} internal loops, {} raised by {}",
+            stats.layers,
+            stats.loops,
+            stats.raised,
+            raised_by(&stats)
+        );
+        if stats.capped > 0 {
+            eprintln!(
+                "bricklayers: {} more were left flat where the wall ends and \
+                 something is printed over it",
+                stats.capped
+            );
+        }
+        if config.wall_width.is_none() {
+            eprintln!(
+                "bricklayers: the file states no internal wall width, so the flow \
+                 below is the shipped default rather than this print's own geometry"
+            );
+        }
+        report_filament(&stats, &applied(&config, &stats));
     }
 
     Ok(())
 }
 
-/// The transform being asked for, if the file already carries its marks.
-fn repeated(command: &Command, survey: &Survey) -> Option<&'static str> {
-    match command {
-        Command::Brick(_) => survey.bricked.then_some("brick"),
-    }
-}
-
-/// Fills in what the command line left out: the layer height, and which end
+/// Fills in what the file and the slicer know: the layer height, and which end
 /// of a wall the loop numbering starts from.
 fn resolve(
     mut config: brick::Config,
-    chosen: Option<WallOrder>,
     slicer: &slicer::Settings,
     source: &Source,
     survey: &Survey,
@@ -120,28 +109,18 @@ fn resolve(
     config.layer_height = if survey.variable_layers() {
         // A nominal says what the slicer was asked for, not what each layer
         // came out at, so it cannot stand in for a file that measures several
-        // heights. Only the command line overrides a measurement.
-        config.layer_height
+        // heights.
+        None
     } else {
-        detected(
-            config.layer_height,
-            slicer.layer_height,
-            source.layer_height(),
-        )
+        slicer.layer_height.or(source.layer_height())
     };
-    // The flag wins outright rather than only being able to turn the order on:
-    // detection reads slicer prose, so it can be wrong in either direction and
-    // both need an escape hatch.
     config.external_perimeters_first =
-        chosen.or(slicer.wall_order).or(survey.wall_order) == Some(WallOrder::ExternalFirst);
+        slicer.wall_order.or(survey.wall_order) == Some(WallOrder::ExternalFirst);
+    config.wall_width = slicer
+        .wall_width
+        .or_else(|| source.wall_width())
+        .or(survey.wall_width);
     config
-}
-
-/// Command line first, then what the slicer exported, then what a binary
-/// container states about itself. A plain file's own comment is left to the
-/// survey, which reads it out of the G-code.
-fn detected(requested: Option<f64>, exported: Option<f64>, stated: Option<f64>) -> Option<f64> {
-    requested.or(exported).or(stated)
 }
 
 /// Slicer settings under which the transform quietly does nothing, or the
@@ -174,10 +153,49 @@ fn warn_slicer_settings(slicer: &slicer::Settings) {
 
 fn warn_layer_height(height: f64, detected: bool) {
     if !detected {
+        eprintln!("bricklayers: warning: no layer height found in the file, assuming {height} mm");
+    }
+}
+
+/// A step this tool leaves standing that is large next to the nozzle laying
+/// the layer above it.
+///
+/// The stagger is half a layer, so the step grows with the layer height while
+/// the nozzle that has to clear it does not. Nothing here can be done about it
+/// without giving up the stagger, so it is said rather than acted on: slicing
+/// thinner is the answer, and it is the user's to make.
+fn warn_step(stats: &brick::Stats, nozzle: Option<f64>) {
+    let Some(nozzle) = nozzle.filter(|nozzle| *nozzle > 0.0) else {
+        return;
+    };
+    let Some((_, step)) = stats.raise else {
+        return;
+    };
+    if step > nozzle / 4.0 {
         eprintln!(
-            "bricklayers: warning: no layer height found in the file, assuming {height} mm; \
-             pass --layer-height to be sure"
+            "bricklayers: warning: loops are raised by up to {step:.3} mm against a \
+             {nozzle} mm nozzle; a layer more than half the nozzle leaves a step the \
+             nozzle drags through, so slice thinner if the walls come out rough"
         );
+    }
+}
+
+/// What `--verbose` calls the flow the walls were metered at: one figure, or
+/// the range an adaptive slice covers, since it follows each layer's own
+/// height. A modifier is named too, or the figure looks like the geometry's
+/// own answer when it is not.
+fn applied(config: &brick::Config, stats: &brick::Stats) -> String {
+    let flow = match stats.flow {
+        Some((low, high)) if format!("{low:.3}") != format!("{high:.3}") => {
+            format!("a flow of {low:.3} to {high:.3}")
+        }
+        Some((low, _)) => format!("a flow of {low:.3}"),
+        None => return "the flow".to_owned(),
+    };
+    if config.extra_flow == brick::DEFAULT_EXTRA_FLOW {
+        flow
+    } else {
+        format!("{flow} (--extra-flow {:.1}%)", config.extra_flow * 100.0)
     }
 }
 
@@ -196,8 +214,8 @@ fn raised_by(stats: &brick::Stats) -> String {
     }
 }
 
-/// Prices what was applied against the whole part, since raised loops are only
-/// a fraction of it and a multiplier reads far larger than it costs.
+/// Prices what was applied against the whole part, since a multiplier reads
+/// far larger than it costs: it is paid only on the walls no one sees.
 fn report_filament(stats: &brick::Stats, applied: &str) {
     if stats.filament <= 0.0 {
         return;

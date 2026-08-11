@@ -7,10 +7,16 @@
 /// The regions this post-processor treats differently.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Feature {
-    /// The visible outermost loop, never shifted.
+    /// The visible outermost loop.
     ExternalPerimeter,
     /// Any hidden loop inside the external perimeter.
     InternalPerimeter,
+    /// A stretch of wall printed over air. Slicers label it in place of the
+    /// wall it belongs to, and it can interrupt an inner wall as readily as an
+    /// outer one — measured on an OrcaSlicer 2.4.2 Benchy, mid-loop, with no
+    /// travel between the two labels. So it names a condition, never which
+    /// wall this is, and it must not decide that a loop is the visible one.
+    Overhang,
     /// Sparse internal infill.
     SparseInfill,
     /// Solid, top and bottom surfaces.
@@ -34,7 +40,7 @@ impl Feature {
     pub fn is_perimeter(self) -> bool {
         matches!(
             self,
-            Feature::ExternalPerimeter | Feature::InternalPerimeter
+            Feature::ExternalPerimeter | Feature::InternalPerimeter | Feature::Overhang
         )
     }
 }
@@ -48,12 +54,15 @@ fn region_label(comment: &str) -> Option<&str> {
 }
 
 fn classify(label: &str) -> Feature {
-    const EXTERNAL: [&str; 4] = ["external perimeter", "outer wall", "wall-outer", "overhang"];
+    const EXTERNAL: [&str; 3] = ["external perimeter", "outer wall", "wall-outer"];
     const INTERNAL: [&str; 3] = ["inner wall", "wall-inner", "perimeter"];
     const SOLID: [&str; 5] = ["solid", "top surface", "bottom surface", "bridge", "skin"];
 
     let has = |needles: &[&str]| needles.iter().any(|needle| contains_fold(label, needle));
-    if has(&EXTERNAL) {
+    // Before the wall tests: `Overhang perimeter` carries both words.
+    if contains_fold(label, "overhang") {
+        Feature::Overhang
+    } else if has(&EXTERNAL) {
         Feature::ExternalPerimeter
     } else if has(&INTERNAL) {
         Feature::InternalPerimeter
@@ -143,20 +152,24 @@ mod tests {
         assert_eq!(Feature::from_comment(";LAYER_CHANGE"), None);
     }
 
-    /// An overhanging stretch of perimeter gets a region of its own, and the
-    /// marker never says which wall it came out of. Neither does anything else
-    /// in the file: on an OrcaSlicer slice 874 of 1148 sat between two outer
-    /// wall regions and 272 between two inner ones, and the line width was a
-    /// flat 0.4 for every one of them where outer walls used 0.42 and inner
-    /// ones 0.45.
+    /// An overhanging stretch of wall is labelled in place of the wall it
+    /// belongs to, and the marker never says which wall that was. Neither does
+    /// anything else in the file: on an OrcaSlicer slice 874 of 1148 sat
+    /// between two outer wall regions and 272 between two inner ones, and the
+    /// line width was a flat 0.4 for every one of them where outer walls used
+    /// 0.42 and inner ones 0.45.
     ///
-    /// Reading them all as external cannot raise a wall that shows, and costs
-    /// almost nothing. Ground truth from the same model sliced with overhang
-    /// detection off: 12% of overhang extrusion was really inner wall, which is
-    /// 0.009% of the print, and bricking the lot moves 46 loops in 15266.
-    /// Guessing the other way risks the one defect this exists to avoid.
+    /// It used to classify as the visible wall, which read as "this loop is
+    /// the outer one". That is false: OrcaSlicer 2.4.2 interrupts an **inner**
+    /// wall with it mid-loop, with no travel between the two labels, so a loop
+    /// that merely began over air was taken for the visible wall, anchored its
+    /// contour and pushed the real outer wall into a contour of its own — 665
+    /// of 21832 visible-wall extrusions came out raised on a 1000-wall Benchy.
+    /// It is now its own class: never an anchor, and never raised on its own
+    /// evidence, since ground truth says 83.7% of it is really the visible
+    /// wall.
     #[test]
-    fn an_overhang_is_treated_as_a_wall_that_shows() {
+    fn an_overhang_is_its_own_class_and_names_no_wall() {
         for label in [
             ";TYPE:Overhang perimeter",
             "; FEATURE: Overhang wall",
@@ -164,10 +177,13 @@ mod tests {
         ] {
             assert_eq!(
                 Feature::from_comment(label),
-                Some(Feature::ExternalPerimeter),
+                Some(Feature::Overhang),
                 "{label}"
             );
         }
+        // It is still a wall, so its loops are buffered and numbered with the
+        // rest of the stack rather than passing through as infill would.
+        assert!(Feature::Overhang.is_perimeter());
     }
 
     /// Nothing a prime tower, wipe or support region does may be mistaken for
@@ -231,9 +247,7 @@ mod tests {
             "Overhang perimeter",
         ] {
             let expected = match label {
-                label if label.eq_ignore_ascii_case("Overhang perimeter") => {
-                    Feature::ExternalPerimeter
-                }
+                label if label.eq_ignore_ascii_case("Overhang perimeter") => Feature::Overhang,
                 _ => Feature::InternalPerimeter,
             };
             assert_eq!(

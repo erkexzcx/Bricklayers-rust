@@ -94,6 +94,8 @@ pub struct Line<'a> {
     pub clockwise: bool,
     e_span: Option<(usize, usize)>,
     z_span: Option<(usize, usize)>,
+    xy_span: Option<((usize, usize), (usize, usize))>,
+    ij_span: Option<((usize, usize), (usize, usize))>,
     comment_at: Option<usize>,
     /// An `X` or `Y` word was present, whether or not its value was read.
     has_xy: bool,
@@ -130,6 +132,8 @@ impl<'a> Line<'a> {
             clockwise,
             e_span: None,
             z_span: None,
+            xy_span: None,
+            ij_span: None,
             comment_at,
             has_xy: false,
         };
@@ -141,6 +145,8 @@ impl<'a> Line<'a> {
         // tracked extruder position with it.
         let feeds = matches!(line.code, Code::Move | Code::Arc | Code::SetPosition);
         let mut at = 0;
+        let (mut x_at, mut y_at) = (None, None);
+        let (mut i_at, mut j_at) = (None, None);
         while at < bytes.len() {
             let byte = bytes[at];
             at += 1;
@@ -172,21 +178,35 @@ impl<'a> Line<'a> {
                 continue;
             };
             match letter {
-                b'x' => line.x = Some(value),
-                b'y' => line.y = Some(value),
+                b'x' => {
+                    line.x = Some(value);
+                    x_at = Some((start, at));
+                }
+                b'y' => {
+                    line.y = Some(value);
+                    y_at = Some((start, at));
+                }
                 b'z' => {
                     line.z = Some(value);
                     line.z_span = Some((start, at));
                 }
                 b'f' => line.f = Some(value),
-                b'i' => line.i = Some(value),
-                b'j' => line.j = Some(value),
+                b'i' => {
+                    line.i = Some(value);
+                    i_at = Some((start, at));
+                }
+                b'j' => {
+                    line.j = Some(value);
+                    j_at = Some((start, at));
+                }
                 _ => {
                     line.e = Some(value);
                     line.e_span = Some((start, at));
                 }
             }
         }
+        line.xy_span = x_at.zip(y_at);
+        line.ij_span = i_at.zip(j_at);
         line
     }
 
@@ -240,6 +260,64 @@ impl<'a> Line<'a> {
     /// that keeps the text and rewrites the value later.
     pub fn e_span(&self) -> Option<(usize, usize)> {
         self.e_span
+    }
+
+    /// Writes the line with its `X`, `Y` and `E` words replaced, an arc's `I`
+    /// and `J` with them, and a `Z` where one is asked for — set in place, or
+    /// added where the line has none. Everything else — the command, the
+    /// feedrate, any comment — is copied byte for byte. Returns false, having
+    /// written nothing, where the line names no `X` and `Y` to replace.
+    ///
+    /// A move can be taken sideways and given a height at once, which is what
+    /// lets the visible wall be drawn inward without costing the loop the
+    /// travel its height change was going to ride.
+    ///
+    /// Coordinates keep the three decimals a slicer writes them at, which is
+    /// one micron: finer than any printer resolves.
+    pub fn write_moved<W: Write>(
+        &self,
+        out: &mut W,
+        to: (f64, f64),
+        centre: Option<(f64, f64)>,
+        e: Option<f64>,
+        z: Option<f64>,
+    ) -> io::Result<bool> {
+        let Some((x_span, y_span)) = self.xy_span else {
+            return Ok(false);
+        };
+        let mut edits = vec![(x_span, to.0, 3usize), (y_span, to.1, 3)];
+        if let (Some((i_span, j_span)), Some(centre)) = (self.ij_span, centre) {
+            edits.push((i_span, centre.0, 3));
+            edits.push((j_span, centre.1, 3));
+        }
+        if let (Some(span), Some(value)) = (self.e_span, e) {
+            edits.push((span, value, 5));
+        }
+        let mut append = None;
+        match (z, self.z_span) {
+            (Some(value), Some(span)) => edits.push((span, value, 3)),
+            (Some(value), None) => append = Some(value),
+            (None, _) => {}
+        }
+        edits.sort_unstable_by_key(|((start, _), _, _)| *start);
+
+        let bytes = self.raw.as_bytes();
+        let mut cut = 0;
+        for ((start, end), value, decimals) in edits {
+            out.write_all(&bytes[cut..start])?;
+            write_fixed(out, value, decimals)?;
+            cut = end;
+        }
+        let Some(value) = append else {
+            out.write_all(&bytes[cut..])?;
+            return Ok(true);
+        };
+        let body = self.comment_at.unwrap_or(self.raw.len());
+        out.write_all(self.raw[cut..body].trim_end().as_bytes())?;
+        out.write_all(b" Z")?;
+        write_fixed(out, value, 3)?;
+        out.write_all(&bytes[body..])?;
+        Ok(true)
     }
 
     /// Writes the line with its `E` word replaced. The rest of it, including
@@ -601,6 +679,104 @@ mod tests {
         assert_eq!(line.z, Some(0.4));
         assert_eq!(line.e, Some(0.05));
         assert_eq!(line.f, Some(1800.0));
+    }
+
+    /// Only the three numbers may change; the command, the feedrate, the
+    /// spacing and the comment are copied byte for byte.
+    #[test]
+    fn a_move_is_rewritten_in_place() {
+        let mut out = Vec::new();
+        let line = Line::parse("G1 X10.5 Y-2 E0.05 F1800 ; wall");
+        assert!(
+            line.write_moved(&mut out, (1.2345, 6.7), None, Some(0.06), None)
+                .unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "G1 X1.234 Y6.700 E0.06000 F1800 ; wall"
+        );
+    }
+
+    /// Word order is a slicer's choice, and a travel has no `E` to rewrite.
+    #[test]
+    fn a_move_is_rewritten_whatever_order_its_words_come_in() {
+        for (raw, want) in [
+            ("G1 Y2 X1 F9000", "G1 Y6.700 X1.234 F9000"),
+            ("G1 X1 Y2", "G1 X1.234 Y6.700"),
+            ("G2 X1 Y2 I3 J4 E1.0", "G2 X1.234 Y6.700 I3 J4 E1.0"),
+        ] {
+            let mut out = Vec::new();
+            assert!(
+                Line::parse(raw)
+                    .write_moved(&mut out, (1.2345, 6.7), None, None, None)
+                    .unwrap()
+            );
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{raw}");
+        }
+    }
+
+    /// An arc states its centre from wherever it starts, so a loop moved
+    /// sideways has to restate it or the arc is swept round the old one.
+    #[test]
+    fn an_arc_keeps_its_centre_when_its_start_moves() {
+        let mut out = Vec::new();
+        assert!(
+            Line::parse("G2 X1 Y2 I3 J4 E1.0")
+                .write_moved(
+                    &mut out,
+                    (1.2345, 6.7),
+                    Some((2.995, 4.004)),
+                    Some(1.5),
+                    None
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "G2 X1.234 Y6.700 I2.995 J4.004 E1.50000"
+        );
+    }
+
+    /// A straight move has no centre to restate, and nothing may be added.
+    #[test]
+    fn a_straight_move_gains_no_centre() {
+        let mut out = Vec::new();
+        assert!(
+            Line::parse("G1 X1 Y2 E1.0")
+                .write_moved(&mut out, (1.0, 2.0), Some((3.0, 4.0)), None, None)
+                .unwrap()
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "G1 X1.000 Y2.000 E1.0");
+    }
+
+    /// The travel that reaches a loop is both taken sideways and given the
+    /// loop's height, on the one line. Splitting the two would put back the
+    /// standalone `G1 Z` that stops the toolhead over the seam.
+    #[test]
+    fn a_move_can_be_taken_sideways_and_given_a_height_at_once() {
+        for (raw, want) in [
+            ("G1 X1 Y2 F9000", "G1 X3.000 Y4.000 F9000 Z0.850"),
+            ("G1 X1 Y2 Z0.4 F9000", "G1 X3.000 Y4.000 Z0.850 F9000"),
+        ] {
+            let mut out = Vec::new();
+            assert!(
+                Line::parse(raw)
+                    .write_moved(&mut out, (3.0, 4.0), None, None, Some(0.85))
+                    .unwrap()
+            );
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_line_with_no_xy_is_not_rewritten() {
+        let mut out = Vec::new();
+        assert!(
+            !Line::parse("G1 Z0.4 F600")
+                .write_moved(&mut out, (1.0, 2.0), None, None, None)
+                .unwrap()
+        );
+        assert!(out.is_empty());
     }
 
     #[test]

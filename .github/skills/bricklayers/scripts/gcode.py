@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 MAX_LOOP_GAP = 2.0
 PROBES = 16
 
-EXTERNAL = ("external perimeter", "outer wall", "wall-outer", "overhang")
+EXTERNAL = ("external perimeter", "outer wall", "wall-outer")
 INTERNAL = ("inner wall", "wall-inner", "perimeter")
 SOLID = ("solid", "top surface", "bottom surface", "bridge", "skin")
 
@@ -26,6 +26,15 @@ WORD = re.compile(r"(?:^|\s)([XYZEF])(-?\d*\.?\d+)")
 def classify(label: str) -> str:
     """Region kind, matching src/feature.rs. Order matters."""
     low = label.strip().lower()
+    # Before the wall tests: "Overhang perimeter" carries both words. An
+    # overhang is labelled in place of the wall it belongs to and names no
+    # wall of its own -- slicers interrupt an inner wall with it mid-loop --
+    # so counting it as external made every raised inner wall look like a
+    # violation. Checking only the beads a slicer really called the outer
+    # wall keeps the invariant's teeth: a raised visible loop carries that
+    # label on at least part of itself, and the whole loop shares one height.
+    if "overhang" in low:
+        return "overhang"
     if any(needle in low for needle in EXTERNAL):
         return "external"
     if any(needle in low for needle in INTERNAL):

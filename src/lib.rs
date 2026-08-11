@@ -2,7 +2,9 @@
 //! as independent flat sheets, which is where FDM prints are weakest.
 //!
 //! [`brick`] raises every other internal perimeter loop by half a layer
-//! height, staggering the seams between loops.
+//! height, staggering the seams between loops, and draws the visible wall a
+//! few microns toward the material behind it so the joint against it closes
+//! without the part growing.
 //!
 //! It streams: G-code arrives a line at a time from a [`Source`] and leaves a
 //! line at a time through a [`Sink`], so a file is never held in memory.
@@ -13,6 +15,7 @@ mod error;
 pub mod feature;
 pub mod footprint;
 pub mod gcode;
+pub mod inset;
 pub mod scan;
 pub mod slicer;
 
@@ -89,6 +92,22 @@ impl Source {
         match &self.kind {
             Kind::Text => None,
             Kind::Binary { container, .. } => container.layer_height,
+        }
+    }
+
+    /// Width the internal perimeters were metered at, for the same reason.
+    pub fn wall_width(&self) -> Option<f64> {
+        match &self.kind {
+            Kind::Text => None,
+            Kind::Binary { container, .. } => container.wall_width,
+        }
+    }
+
+    /// Nozzle diameter the file states about itself, for the same reason.
+    pub fn nozzle(&self) -> Option<f64> {
+        match &self.kind {
+            Kind::Text => None,
+            Kind::Binary { container, .. } => container.nozzle,
         }
     }
 

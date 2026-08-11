@@ -129,7 +129,7 @@ fn brick_rewrites_the_file_in_place() {
     let source = sample_gcode();
     let path = sandbox.with_gcode(&source);
 
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let result = fs::read_to_string(&path).expect("read result");
@@ -140,16 +140,16 @@ fn brick_rewrites_the_file_in_place() {
 }
 
 #[test]
-fn brick_leaves_external_perimeters_and_infill_untouched() {
+fn brick_leaves_infill_untouched_and_meters_every_wall() {
     let sandbox = Sandbox::new("brick-untouched");
     let path = sandbox.with_gcode(&sample_gcode());
-    run(&["brick", path.to_str().unwrap()]);
+    run(&[path.to_str().unwrap()]);
 
     let result = fs::read_to_string(&path).expect("read result");
     assert_eq!(
         result.matches("E0.66000").count(),
-        20,
-        "external perimeter extrusions must be unchanged"
+        4,
+        "only the bed layer's visible wall may be left as sliced"
     );
     assert_eq!(
         result.matches("E1.20000").count(),
@@ -162,7 +162,7 @@ fn brick_leaves_external_perimeters_and_infill_untouched() {
 fn brick_never_leaves_the_nozzle_raised_into_the_next_region() {
     let sandbox = Sandbox::new("brick-z");
     let path = sandbox.with_gcode(&sample_gcode());
-    run(&["brick", path.to_str().unwrap()]);
+    run(&[path.to_str().unwrap()]);
     let result = fs::read_to_string(&path).expect("read result");
 
     let mut z = 0.0_f64;
@@ -185,25 +185,25 @@ fn brick_never_leaves_the_nozzle_raised_into_the_next_region() {
 }
 
 #[test]
-fn a_second_run_of_the_same_transform_is_refused() {
+fn a_second_run_over_the_same_file_is_refused() {
     let sandbox = Sandbox::new("rerun");
     let path = sandbox.with_gcode(&sample_gcode());
     let file = path.to_str().unwrap();
 
-    assert!(run(&["brick", file]).status.success());
+    assert!(run(&[file]).status.success());
     let once = fs::read_to_string(&path).expect("read result");
 
-    let output = run(&["brick", file]);
+    let output = run(&[file]);
     assert!(!output.status.success(), "a repeat run must fail");
     let report = String::from_utf8_lossy(&output.stderr);
-    assert!(report.contains("already carries brick marks"), "{report}");
+    assert!(report.contains("has already been bricked"), "{report}");
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
         once,
         "a refused run must leave the file alone"
     );
 
-    let output = run(&["brick", "--force", file]);
+    let output = run(&["--force", file]);
     assert!(output.status.success(), "--force overrides: {output:?}");
     assert_ne!(fs::read_to_string(&path).unwrap(), once);
 }
@@ -252,12 +252,7 @@ fn output_flag_leaves_the_input_alone() {
     let path = sandbox.with_gcode(&source);
     let target = sandbox.path().join("out.gcode");
 
-    let output = run(&[
-        "brick",
-        "-o",
-        target.to_str().unwrap(),
-        path.to_str().unwrap(),
-    ]);
+    let output = run(&["-o", target.to_str().unwrap(), path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs::read_to_string(&path).unwrap(), source);
     assert!(fs::read_to_string(&target).unwrap().contains("bricklayers"));
@@ -267,7 +262,7 @@ fn output_flag_leaves_the_input_alone() {
 fn no_temporary_files_are_left_behind() {
     let sandbox = Sandbox::new("atomic");
     let path = sandbox.with_gcode(&sample_gcode());
-    run(&["brick", path.to_str().unwrap()]);
+    run(&[path.to_str().unwrap()]);
 
     let leftovers: Vec<_> = fs::read_dir(sandbox.path())
         .unwrap()
@@ -280,7 +275,7 @@ fn no_temporary_files_are_left_behind() {
 
 #[test]
 fn a_missing_file_fails_with_a_readable_message() {
-    let output = run(&["brick", "/nonexistent/part.gcode"]);
+    let output = run(&["/nonexistent/part.gcode"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("/nonexistent/part.gcode"), "{stderr}");
@@ -297,7 +292,7 @@ fn a_rewrite_keeps_the_permissions_the_file_had() {
     let path = sandbox.with_gcode(&sample_gcode());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
 
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
@@ -307,7 +302,6 @@ fn a_rewrite_keeps_the_permissions_the_file_had() {
     // rather than leaving a private file's contents world readable.
     let target = sandbox.path().join("copy.gcode");
     let output = run(&[
-        "brick",
         "--force",
         "-o",
         target.to_str().unwrap(),
@@ -328,7 +322,7 @@ fn the_layer_laid_on_the_bed_is_left_exactly_as_sliced() {
     let file = path.to_str().unwrap();
 
     let output = run_with_env(
-        &["brick", file],
+        &[file],
         &[
             ("SLIC3R_LAYER_HEIGHT", "0.2"),
             ("SLIC3R_FIRST_LAYER_HEIGHT", "0.3"),
@@ -359,7 +353,7 @@ fn a_comment_that_is_not_utf8_does_not_stop_the_transform() {
     named.append(&mut source);
     let path = sandbox.with_bytes(&named);
 
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let result = fs::read_to_string(&path).expect("result is valid UTF-8");
@@ -368,8 +362,8 @@ fn a_comment_that_is_not_utf8_does_not_stop_the_transform() {
     assert!(result.contains("; printing object Caf"), "{result}");
     assert_eq!(
         result.matches("E0.66000").count(),
-        20,
-        "external perimeter extrusions must still be untouched"
+        4,
+        "only the bed layer's visible wall may be left as sliced"
     );
 }
 
@@ -410,7 +404,7 @@ fn a_wall_closed_by_a_solid_surface_partway_up_is_left_flat() {
 
     let sandbox = Sandbox::new("shoulder");
     let path = sandbox.with_gcode(&text);
-    let output = run(&["brick", "--verbose", path.to_str().unwrap()]);
+    let output = run(&["--verbose", path.to_str().unwrap()]);
     assert!(output.status.success());
     let out = std::fs::read_to_string(&path).unwrap();
     assert_wellformed(&out);
@@ -447,25 +441,287 @@ fn a_wall_closed_by_a_solid_surface_partway_up_is_left_flat() {
 #[test]
 fn verbose_reports_a_summary() {
     let sandbox = Sandbox::new("verbose");
-    let path = sandbox.with_gcode(&sample_gcode());
-    let output = run(&[
-        "brick",
-        "--extrusion-multiplier",
-        "1.05",
-        "--verbose",
-        path.to_str().unwrap(),
-    ]);
+    let path = sandbox.with_gcode(&format!(
+        "; inner_wall_line_width = 0.45\n{}",
+        sample_gcode()
+    ));
+    let output = run(&["--verbose", path.to_str().unwrap()]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("5 layers"), "{stderr}");
-    assert!(stderr.contains("10 internal loops"), "{stderr}");
+    // Three walls a layer, the visible one included.
+    assert!(stderr.contains("15 internal loops"), "{stderr}");
     // One per layer, less the bed layer, which is never raised, and the top
     // one, which caps the wall flat.
     assert!(stderr.contains("3 raised"), "{stderr}");
     assert!(stderr.contains("in raised loops"), "{stderr}");
     assert!(
-        stderr.contains("--extrusion-multiplier 1.05"),
-        "the default multiplier must be priced in the summary: {stderr}"
+        stderr.contains("a flow of 1.025"),
+        "the flow that was applied must be priced in the summary: {stderr}"
+    );
+}
+
+/// A file that never states how wide its walls were metered still gets a flow,
+/// but it is the shipped default rather than this print's own geometry, and
+/// the difference has to be visible or "read off the file" is a claim the user
+/// cannot check.
+#[test]
+fn a_file_that_states_no_width_says_the_flow_is_a_default() {
+    let sandbox = Sandbox::new("no-width");
+    let path = sandbox.with_gcode(&sample_gcode());
+    let output = run(&["--verbose", path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("states no internal wall width"), "{stderr}");
+
+    let stated = Sandbox::new("width");
+    let path = stated.with_gcode(&format!(
+        "; inner_wall_line_width = 0.45\n{}",
+        sample_gcode()
+    ));
+    let output = run(&["--verbose", path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("states no internal wall width"),
+        "{stderr}"
+    );
+}
+
+/// Nothing has to be passed for the walls to be metered: the flow comes off
+/// the geometry the file states about itself, so a profile laying narrow beads
+/// through a fine nozzle pays more than one laying wide ones.
+#[test]
+fn the_flow_is_read_off_the_file_with_no_flag_given() {
+    let report = |stated: &str| {
+        let sandbox = Sandbox::new("derived-flow");
+        let path = sandbox.with_gcode(&format!(
+            "; nozzle_diameter = 0.4\n; inner_wall_line_width = {stated}\n{}",
+            sample_gcode()
+        ));
+        let output = run(&["--verbose", path.to_str().unwrap()]);
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let narrow = report("0.35");
+    assert!(narrow.contains("a flow of 1.033"), "{narrow}");
+    let wide = report("0.65");
+    assert!(wide.contains("a flow of 1.017"), "{wide}");
+    // A percentage is of the nozzle, and 0.4 mm of it is the reference wall.
+    let share = report("112.5%");
+    assert!(share.contains("a flow of 1.025"), "{share}");
+}
+
+/// The dial names the extra a wall takes where the layer is as thick as the
+/// nozzle, so a 0.2 mm layer through a 0.4 mm nozzle takes half of it. The
+/// visible wall moves with it so the part keeps its dimensions either way.
+#[test]
+fn the_extra_flow_dial_sets_the_slope_the_geometry_follows() {
+    let report = |percent: &str| {
+        let sandbox = Sandbox::new("extra-flow");
+        let path = sandbox.with_gcode(&format!(
+            "; inner_wall_line_width = 0.45\n{}",
+            sample_gcode()
+        ));
+        let output = run(&["--extra-flow", percent, "--verbose", path.to_str().unwrap()]);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let half = report("2.5");
+    assert!(half.contains("a flow of 1.012"), "{half}");
+    assert!(half.contains("--extra-flow 2.5%"), "{half}");
+
+    let more = report("10");
+    assert!(more.contains("a flow of 1.050"), "{more}");
+
+    let none = report("0");
+    assert!(none.contains("a flow of 1.000"), "{none}");
+
+    // Left alone it is not named, because there is nothing to explain.
+    let sandbox = Sandbox::new("extra-flow-default");
+    let path = sandbox.with_gcode(&format!(
+        "; inner_wall_line_width = 0.45\n{}",
+        sample_gcode()
+    ));
+    let output = run(&["--verbose", path.to_str().unwrap()]);
+    let plain = String::from_utf8_lossy(&output.stderr);
+    assert!(plain.contains("a flow of 1.025"), "{plain}");
+    assert!(!plain.contains("--extra-flow"), "{plain}");
+}
+
+/// A slicer running this as a post-processing script exports its whole
+/// configuration, and what it says outranks the copy in the file.
+#[test]
+fn the_slicer_environment_states_the_width_too() {
+    let sandbox = Sandbox::new("env-width");
+    let path = sandbox.with_gcode(&format!(
+        "; inner_wall_line_width = 0.45\n{}",
+        sample_gcode()
+    ));
+    let output = run_with_env(
+        &["--verbose", path.to_str().unwrap()],
+        &[
+            ("SLIC3R_NOZZLE_DIAMETER", "0.4"),
+            ("SLIC3R_PERIMETER_EXTRUSION_WIDTH", "87.5%"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("a flow of 1.033"), "{stderr}");
+}
+
+/// The stagger is half a layer, so the step it leaves grows with the layer
+/// height while the nozzle that has to clear it does not. Nothing here can fix
+/// that without giving up the stagger, so it is said plainly instead.
+#[test]
+fn a_layer_more_than_half_the_nozzle_is_warned_about() {
+    let sandbox = Sandbox::new("thick-layer");
+    let path = sandbox.with_gcode(&format!(
+        "; nozzle_diameter = 0.4\n; layer_height = 0.3\n{}",
+        gcode_at(&[0.3, 0.6, 0.9, 1.2, 1.5])
+    ));
+    let output = run(&[path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning"), "{stderr}");
+    assert!(stderr.contains("0.4 mm nozzle"), "{stderr}");
+
+    // The same file at a layer the nozzle can clear says nothing.
+    let quiet = Sandbox::new("thin-layer");
+    let path = quiet.with_gcode(&format!("; nozzle_diameter = 0.4\n{}", sample_gcode()));
+    let output = run(&[path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("warning"), "{stderr}");
+}
+
+/// The flow is for the walls, the visible one included: every wall above the
+/// bed is re-metered, and nothing that is not a wall — the solid surfaces that
+/// close the part top and bottom, the infill between them — is touched.
+#[test]
+fn every_wall_above_the_bed_is_rescaled_and_nothing_else_is() {
+    let sandbox = Sandbox::new("walls");
+    let path = sandbox.with_gcode(&sample_gcode());
+    let output = run(&["--verbose", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+
+    let result = fs::read_to_string(&path).expect("read result");
+    assert_wellformed(&result);
+    assert_eq!(
+        result.matches("E0.66000").count(),
+        4,
+        "only the bed layer's visible wall may be left as sliced"
+    );
+    assert_eq!(
+        result.matches("E1.20000").count(),
+        5,
+        "infill and solid surfaces must be unchanged"
+    );
+    // Eight of the file's forty internal perimeter moves are on the bed, and
+    // those are the only ones left as sliced.
+    assert_eq!(
+        result.matches("E0.64000").count(),
+        8,
+        "every wall above the bed must be re-metered:\n{result}"
+    );
+}
+
+/// A file handed no flags at all still gets the shipped flow.
+#[test]
+fn the_shipped_default_rescales_the_walls() {
+    let sandbox = Sandbox::new("default-flow");
+    let path = sandbox.with_gcode(&sample_gcode());
+    assert!(run(&[path.to_str().unwrap()]).status.success());
+
+    let result = fs::read_to_string(&path).expect("read result");
+    // 0.64 at 1.025, on every internal perimeter move but the bed layer's and
+    // those the raise meters for a step of their own: 1.25 while a column
+    // climbs, 0.5 where one is capped.
+    assert_eq!(
+        result.matches("E0.65600").count(),
+        20,
+        "the walls metered over:\n{result}"
+    );
+    assert_eq!(result.matches("E0.82000").count(), 8, "climbing");
+    assert_eq!(result.matches("E0.32800").count(), 4, "capped");
+    assert_eq!(result.matches("E0.64000").count(), 8, "the bed layer");
+    assert_eq!(
+        result.matches("E0.67616").count(),
+        16,
+        "the visible wall metered over as well, and shortened by coming in"
+    );
+    assert_eq!(
+        result.matches("E0.66000").count(),
+        4,
+        "and only the bed layer's left as sliced"
+    );
+}
+
+/// The visible wall is brought toward the loop behind it by half of what the
+/// multiplier would have added as flow, so the joint against it closes without
+/// the part growing. It needs the width the wall was metered at, which only the
+/// file can state.
+#[test]
+fn the_visible_wall_is_drawn_in_where_the_file_states_its_width() {
+    let sandbox = Sandbox::new("skin-inset");
+    let stated = sample_gcode().replace(
+        "; layer_height = 0.2\n",
+        "; layer_height = 0.2\n; external_perimeter_extrusion_width = 0.4\n",
+    );
+    let path = sandbox.with_gcode(&stated);
+    let output = run(&[path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+
+    let result = fs::read_to_string(&path).expect("read result");
+    assert_wellformed(&result);
+    // A 0.4 mm wall is laid 0.357 mm from its neighbour at these layers, so at
+    // the flow its geometry asks for, 1.025, it widens by 0.0089 and comes in
+    // by half of that on all four sides, landing its outer face back where it
+    // was. Four of the file's five layers: the one on the build plate is left
+    // exactly as sliced.
+    assert_eq!(
+        result.matches("G1 X19.996 Y0.004 ").count(),
+        4,
+        "the visible wall must come in by the offset:\n{result}"
+    );
+    assert_eq!(
+        result.matches("E0.67620").count(),
+        16,
+        "and carry the filament its new width asks for"
+    );
+    assert_eq!(
+        result.matches("E0.66000").count(),
+        4,
+        "only the bed layer's four beads may be left as sliced"
+    );
+    assert_eq!(
+        result.matches("G1 X20.000 Y0.000 E0.66000").count(),
+        1,
+        "and only on the bed layer"
+    );
+}
+
+/// A file that states no width still has its visible wall drawn in. Scaling a
+/// wall without moving it grows the part by half of what the wall gained, so
+/// the offset falls back to the same reference profile the flow does rather
+/// than to nothing. Cura writes its settings in a form nothing else parses,
+/// which is the file this is about.
+#[test]
+fn a_file_that_states_no_wall_width_falls_back_to_the_reference_profile() {
+    let sandbox = Sandbox::new("skin-untouched");
+    let path = sandbox.with_gcode(&sample_gcode());
+    assert!(run(&[path.to_str().unwrap()]).status.success());
+
+    let result = fs::read_to_string(&path).expect("read result");
+    assert_eq!(
+        result.matches("E0.66000").count(),
+        4,
+        "only the bed layer's visible wall may be left as sliced:\n{result}"
+    );
+    // 0.45 mm at 0.2 mm layers and a flow of 1.025 comes in by 0.005.
+    assert_eq!(
+        result.matches("G1 X19.995 Y0.005 ").count(),
+        4,
+        "and the rest must come in by the reference profile's offset:\n{result}"
+    );
+    assert_eq!(
+        result.matches("G1 X20.000 Y0.000 E").count(),
+        1,
+        "leaving only the bed layer where the slicer drew it"
     );
 }
 
@@ -476,7 +732,7 @@ fn help_and_version_are_available() {
         assert!(output.status.success(), "{command:?} failed");
         assert!(!output.stdout.is_empty());
     }
-    assert!(run(&["brick", "--help"]).status.success());
+    assert!(run(&["--help"]).status.success());
 }
 
 #[test]
@@ -487,27 +743,11 @@ fn the_slicer_environment_supplies_the_layer_height() {
     let path = sandbox.with_gcode(&sample_gcode().replace("; layer_height = 0.2\n", ""));
     let file = path.to_str().unwrap();
 
-    let output = run_with_env(
-        &["brick", "--verbose", file],
-        &[("SLIC3R_LAYER_HEIGHT", "0.3")],
-    );
+    let output = run_with_env(&["--verbose", file], &[("SLIC3R_LAYER_HEIGHT", "0.3")]);
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("raised by 0.150 mm"), "{report}");
     assert!(!report.contains("warning"), "{report}");
-
-    // Back to a pristine file: the first run left its marks, and a second
-    // brick over those is refused.
-    sandbox.with_gcode(&sample_gcode().replace("; layer_height = 0.2\n", ""));
-    let output = run_with_env(
-        &["brick", "--verbose", "--layer-height", "0.1", file],
-        &[("SLIC3R_LAYER_HEIGHT", "0.3")],
-    );
-    let report = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        report.contains("raised by 0.050 mm"),
-        "the flag must win: {report}"
-    );
 }
 
 /// An adaptive slice has no one layer height, so the nominal a slicer exports
@@ -521,30 +761,13 @@ fn a_varied_layer_height_is_measured_rather_than_taken_from_the_slicer() {
     let path = sandbox.with_gcode(&gcode_at(&planes));
     let file = path.to_str().unwrap();
 
-    let output = run_with_env(
-        &["brick", "--verbose", file],
-        &[("SLIC3R_LAYER_HEIGHT", "0.3")],
-    );
+    let output = run_with_env(&["--verbose", file], &[("SLIC3R_LAYER_HEIGHT", "0.3")]);
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("varied the layer height"), "{report}");
     assert!(
         report.contains("raised by 0.050 to 0.100 mm"),
         "each layer takes its own half, not half of the exported 0.3: {report}"
-    );
-
-    // Back to a pristine file: the first run left its marks, and a second
-    // brick over those is refused. The flag is the escape hatch, so it puts
-    // one height back onto every layer.
-    sandbox.with_gcode(&gcode_at(&planes));
-    let output = run_with_env(
-        &["brick", "--verbose", "--layer-height", "0.2", file],
-        &[("SLIC3R_LAYER_HEIGHT", "0.3")],
-    );
-    let report = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        report.contains("raised by 0.100 mm"),
-        "the flag must win: {report}"
     );
 }
 
@@ -554,7 +777,7 @@ fn slicer_settings_that_defeat_the_transform_are_reported() {
     let path = sandbox.with_gcode(&sample_gcode());
 
     let output = run_with_env(
-        &["brick", path.to_str().unwrap()],
+        &[path.to_str().unwrap()],
         &[
             ("SLIC3R_WALL_SEQUENCE", "inner wall/outer wall"),
             ("SLIC3R_WALL_LOOPS", "1"),
@@ -579,7 +802,7 @@ fn two_walls_are_bricked_rather_than_refused() {
     let path = sandbox.with_gcode(&sample_gcode());
 
     let output = run_with_env(
-        &["brick", "--verbose", path.to_str().unwrap()],
+        &["--verbose", path.to_str().unwrap()],
         &[("SLIC3R_PERIMETERS", "2")],
     );
     assert!(output.status.success(), "{output:?}");
@@ -595,10 +818,7 @@ fn a_single_wall_is_reported_as_leaving_nothing_to_raise() {
     let sandbox = Sandbox::new("env-one-wall");
     let path = sandbox.with_gcode(&sample_gcode());
 
-    let output = run_with_env(
-        &["brick", path.to_str().unwrap()],
-        &[("SLIC3R_PERIMETERS", "1")],
-    );
+    let output = run_with_env(&[path.to_str().unwrap()], &[("SLIC3R_PERIMETERS", "1")]);
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("1 wall(s)"), "{report}");
@@ -617,7 +837,7 @@ fn walls_emitted_as_arcs_draw_no_warning() {
     );
     let path = sandbox.with_gcode(&arced);
 
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(!report.contains("arc"), "{report}");
@@ -629,7 +849,7 @@ fn a_well_configured_slicer_draws_no_warnings() {
     let path = sandbox.with_gcode(&sample_gcode());
 
     let output = run_with_env(
-        &["brick", path.to_str().unwrap()],
+        &[path.to_str().unwrap()],
         &[
             ("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1"),
             ("SLIC3R_PERIMETERS", "3"),
@@ -642,40 +862,27 @@ fn a_well_configured_slicer_draws_no_warnings() {
     assert!(!report.contains("warning"), "{report}");
 }
 
-/// The slicer setting is only a claim, and detection reads prose to interpret
-/// it. `--wall-order` has to beat that claim in both directions — the flag it
-/// replaced could only turn external-first on, so a file misread as
-/// external-first had no way back.
+/// The visible wall anchors the alternation by being recognised, not by being
+/// counted from one end, so once it is in the contour the order the slicer
+/// printed the walls in no longer decides anything. It is still the fallback
+/// for a contour that holds no visible wall.
 #[test]
-fn the_wall_order_flag_overrides_what_the_slicer_says() {
+fn the_wall_order_no_longer_decides_where_the_alternation_starts() {
     let sandbox = Sandbox::new("wall-order");
-    let claims_external_first = [("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1")];
 
-    let bricked = |flag: Option<&str>| {
+    let bricked = |settings: &[(&str, &str)]| {
         let path = sandbox.with_gcode(&sample_gcode());
-        let mut args = vec!["brick"];
-        if let Some(flag) = flag {
-            args.extend(["--wall-order", flag]);
-        }
-        args.push(path.to_str().unwrap());
-        let output = run_with_env(&args, &claims_external_first);
+        let output = run_with_env(&[path.to_str().unwrap()], settings);
         assert!(output.status.success(), "{output:?}");
         let result = fs::read_to_string(&path).expect("read result");
         assert_wellformed(&result);
         result
     };
 
-    let detected = bricked(None);
-    assert_eq!(detected, bricked(Some("auto")), "auto is not the default");
     assert_eq!(
-        detected,
-        bricked(Some("external-first")),
-        "forcing what was detected changed the output"
-    );
-    assert_ne!(
-        detected,
-        bricked(Some("internal-first")),
-        "internal-first did not override the slicer's setting"
+        bricked(&[("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1")]),
+        bricked(&[("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "0")]),
+        "the visible wall anchors the stack whichever end it was printed at"
     );
 }
 
@@ -683,7 +890,7 @@ fn the_wall_order_flag_overrides_what_the_slicer_says() {
 fn crlf_input_is_accepted() {
     let sandbox = Sandbox::new("crlf");
     let path = sandbox.with_gcode(&sample_gcode().replace('\n', "\r\n"));
-    let output = run(&["brick", path.to_str().unwrap()]);
+    let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let result = fs::read_to_string(&path).expect("read result");
@@ -702,12 +909,7 @@ fn streaming_a_file_matches_rewriting_it_in_memory() {
 
     let in_memory = brick::apply(&source, &brick::Config::default()).gcode;
     let out = sandbox.path().join("brick.gcode");
-    let output = run(&[
-        "brick",
-        "--output",
-        out.to_str().unwrap(),
-        path.to_str().unwrap(),
-    ]);
+    let output = run(&["--output", out.to_str().unwrap(), path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let streamed = fs::read_to_string(&out).expect("read result");
@@ -720,13 +922,9 @@ fn no_transform_ever_commands_a_z_below_the_bed() {
     let sandbox = Sandbox::new("below-bed");
     let path = sandbox.with_gcode(&sample_gcode());
 
-    for args in [
-        vec!["brick"],
-        vec!["brick", "--extrusion-multiplier", "1.05"],
-        vec!["brick", "--reorder-loops"],
-    ] {
-        let out = sandbox.path().join(format!("{}.gcode", args.join("-")));
-        let mut call = args.clone();
+    for args in [vec!["plain"], vec!["verbose", "--verbose"]] {
+        let out = sandbox.path().join(format!("{}.gcode", args[0]));
+        let mut call: Vec<&str> = args[1..].to_vec();
         call.extend(["--output", out.to_str().unwrap(), path.to_str().unwrap()]);
         let output = run(&call);
         assert!(output.status.success(), "{args:?}: {output:?}");
@@ -772,12 +970,7 @@ fn coordinates_on_a_rounding_boundary_survive_the_binary() {
     let path = sandbox.with_gcode(&source);
 
     let out = sandbox.path().join("brick.gcode");
-    let output = run(&[
-        "brick",
-        "--output",
-        out.to_str().unwrap(),
-        path.to_str().unwrap(),
-    ]);
+    let output = run(&["--output", out.to_str().unwrap(), path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
     let result = fs::read_to_string(&out).expect("read result");

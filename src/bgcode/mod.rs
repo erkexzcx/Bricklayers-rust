@@ -42,6 +42,12 @@ pub struct Container {
     /// Layer height from the file's metadata, which plain G-code carries as a
     /// comment but binary G-code keeps out of the G-code stream.
     pub layer_height: Option<f64>,
+    /// Width the internal perimeters were metered at, in mm, from the same
+    /// metadata, resolved against the nozzle where it is stated as a share of
+    /// it.
+    pub wall_width: Option<f64>,
+    /// Nozzle diameter in mm.
+    pub nozzle: Option<f64>,
 }
 
 impl Container {
@@ -66,6 +72,8 @@ impl Container {
         let mut block = Vec::new();
         let mut compression = Compression::Heatshrink12;
         let mut layer_height = None;
+        let mut wall_width: Option<String> = None;
+        let mut nozzle: Option<String> = None;
 
         while !ended(&mut input)? {
             let start = at;
@@ -90,24 +98,36 @@ impl Container {
             at += rest as u64;
             verify(&block, checksums, start)?;
 
-            if layer_height.is_none()
+            if (layer_height.is_none() || wall_width.is_none() || nozzle.is_none())
                 && let Ok(ini) = decompress(
                     payload(&block, &header, trailer),
                     header.packing,
                     header.uncompressed,
                 )
             {
-                layer_height = setting(&ini, "layer_height");
+                if layer_height.is_none() {
+                    layer_height = setting(&ini, "layer_height");
+                }
+                if wall_width.is_none() {
+                    wall_width = text(&ini, "perimeter_extrusion_width")
+                        .or_else(|| text(&ini, "inner_wall_line_width"));
+                }
+                if nozzle.is_none() {
+                    nozzle = text(&ini, "nozzle_diameter");
+                }
             }
             prelude.extend_from_slice(&block);
         }
 
+        let nozzle = crate::scan::width(nozzle.as_deref(), None);
         Ok(Self {
             version,
             checksums,
             prelude,
             compression,
             layer_height,
+            wall_width: crate::scan::width(wall_width.as_deref(), nozzle),
+            nozzle,
         })
     }
 
@@ -524,20 +544,24 @@ fn parameters_size(kind: u16) -> Result<usize, String> {
     }
 }
 
-/// Reads one `key=value` line out of a metadata block. Both keys this is asked
-/// for are heights the nozzle is driven by, so a value that is not a length is
+/// Reads one `key=value` line out of a metadata block. The key this is asked
+/// for is a height the nozzle is driven by, so a value that is not a length is
 /// no better than a missing one.
 fn setting(ini: &[u8], key: &str) -> Option<f64> {
-    std::str::from_utf8(ini)
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            let (found, value) = line.split_once('=')?;
-            (found.trim() == key)
-                .then(|| value.trim().parse().ok())
-                .flatten()
-        })
+    text(ini, key)?
+        .parse()
+        .ok()
         .filter(crate::scan::is_a_height)
+}
+
+/// The value of one `key=value` line, exactly as the metadata block states it.
+/// A width is only a number once the nozzle it may be a percentage of has been
+/// read, which can be a block later.
+fn text(ini: &[u8], key: &str) -> Option<String> {
+    std::str::from_utf8(ini).ok()?.lines().find_map(|line| {
+        let (found, value) = line.split_once('=')?;
+        (found.trim() == key).then(|| value.trim().to_owned())
+    })
 }
 
 #[cfg(test)]
@@ -551,6 +575,8 @@ mod tests {
             prelude: Vec::new(),
             compression: Compression::Heatshrink12,
             layer_height: None,
+            wall_width: None,
+            nozzle: None,
         }
     }
 

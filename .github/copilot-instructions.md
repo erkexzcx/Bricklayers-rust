@@ -1,8 +1,23 @@
 # bricklayers — project guidelines
 
-A single Rust binary that post-processes sliced G-code. One transform: `brick`
-(raise alternate internal perimeter loops by half a layer height). It runs as a
-slicer post-processing script, so it is handed the user's only copy of a file.
+A single Rust binary that post-processes sliced G-code. It does one thing — raise
+alternate internal perimeter loops by half a layer height — and takes no
+sub-command and no settings, only a file. It runs as a slicer post-processing
+script, so it is handed the user's only copy of a file.
+
+## Fix it, do not report it
+
+**Anything you find is either a bug or a limitation. There is no third
+category, and "worth doing later" is not one.**
+
+- If it can genuinely be fixed, **fix it, without asking**. Large is not an
+  excuse to defer: if the fix is a week of work, do the week of work.
+- Only something that truly cannot be fixed is a limitation, and a limitation
+  goes in README.md with the measurement behind it.
+- Never end a turn offering to fix a defect you have already found. Fix it,
+  verify it, then say what changed.
+- A defect found in someone's real file is worth more than any synthetic test.
+  Reproduce it, fix it, and add the test the fixture would have needed.
 
 ## Read this first
 
@@ -16,6 +31,12 @@ recorded there started as a confident claim about what a slicer emits.
 **Do not assert what a slicer emits — measure it.** Slice a real file, count,
 then write the code. Numbers that go into the source or the skill must come from
 a real print, not from reading slicer source or reasoning from first principles.
+
+**The README's diagrams are generated, not drawn.** Before restyling one or
+changing a constant the picture depends on, load
+[.github/skills/diagrams/SKILL.md](skills/diagrams/SKILL.md); `scripts/pin.py`
+there proves the figure still agrees with `src/brick.rs` and with the compiled
+binary, and it has to pass before `scripts/render.py` is run.
 
 ## Build and test
 
@@ -47,9 +68,9 @@ Fixtures are not enough — check a change against a real slice too. `--output`
 leaves the input intact and `--verbose` says whether anything happened:
 
 ```sh
-cargo run -- brick --extrusion-multiplier 1.05 --verbose --output /tmp/out.gcode ~/Downloads/part.gcode
-# bricklayers: 247 layers, 1976 internal loops, 988 raised by 0.100 mm
-# bricklayers: 7982.6 mm filament, 30.5% of it in raised loops; --extrusion-multiplier 1.05 adds 1.44% to the part
+cargo run -- --verbose --output /tmp/out.gcode ~/Downloads/part.gcode
+# bricklayers: 240 layers, 1365 internal loops, 533 raised by 0.100 mm
+# bricklayers: 5053.7 mm filament, 16.5% of it in raised loops; a flow of 1.020 adds 0.86% to the part
 ```
 
 Zero counts mean the region markers were not recognised — grep the input for
@@ -67,11 +88,12 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
 | `src/gcode.rs` | byte-scanner line parser (no regex), `Extruder` M82/M83 mapping, `Lines` reader |
 | `src/feature.rs` | Prusa/Orca/Bambu/Cura region markers → one enum |
 | `src/footprint.rs` | where a layer's walls sit, as grid cells, so "is anything above this loop?" is a binary search |
+| `src/inset.rs` | moving a closed loop sideways, toward the material behind it |
 | `src/scan.rs` | `Survey`: the single pre-pass |
 | `src/brick.rs` | the `brick` transform |
 | `src/slicer.rs` | `SLIC3R_*` settings the slicer exports to a post-process script |
 | `src/bgcode/` | binary G-code container, heatshrink, meatpack |
-| `src/cli.rs`, `src/main.rs` | clap derive, subcommand `brick` |
+| `src/cli.rs`, `src/main.rs` | clap derive; the whole command line is a G-code path plus `--output`/`--verbose`/`--force` |
 | `benches/throughput.rs` | synthetic slice + wall clock, no framework |
 
 ## Invariants that are easy to break
@@ -147,6 +169,40 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
   layer with the previous layer's — a Z-hop only ever raises the nozzle, so a
   per-layer minimum is the layer's own height. Measured on a real OrcaSlicer
   2-object slice: one drop, 21.8 mm to 0.2 mm at layer 109 of 218.
+- **The wall flow is READ OFF THE FILE, per layer, and it is not a void being
+  filled.** The only dial is `--extra-flow` (0 to 50 percent), and it names the
+  extra a wall takes where the layer is as thick as the NOZZLE — a slope, not an
+  absolute flow — which is what keeps an adaptive slice metered per layer.
+  `Config::wall_flow` pins one absolutely and is for tests and library callers.
+  Slicers space
+  beads at `w - h(1 - π/4)`, not at the nominal width, and at that spacing a
+  bead's area is exactly `h × spacing` — measured again 2026-08-11 on three
+  real slices (0.0773 mm² metered against 0.0774 predicted; loops 0.4074 mm
+  apart against 0.4071 predicted; the nominal-width model says 0.0855). So
+  `void% = 21.46 × h/w` describes a slicer that does not exist. What scales is
+  the *share of a bead sitting in the corner beside its neighbour*, which is
+  `h / spacing`, and `brick::automatic_flow` is that slope anchored on the
+  reference profile and held to `brick::flow_ceiling` — the flow at which a
+  bead's edge reaches the centre of the loop beside it, `2 - h(1-π/4)/s`,
+  which is the bead model's own arithmetic and not a chosen number. Do NOT
+  re-derive it as a volume
+  deficit; do NOT reintroduce a picked ceiling; do NOT change
+  `DEFAULT_EXTRA_FLOW`, `REFERENCE_NOZZLE`,
+  `REFERENCE_HEIGHT` or `REFERENCE_WIDTH` without re-checking every number in
+  the README's flow tables.
+- **The visible wall's inward offset must move with the flow.**
+  `Pass::skin_offset()` is a method, not a field: on an adaptive slice the flow
+  changes every layer, and an offset fixed at open time would disagree with it
+  everywhere. Scaling without moving grows the part; moving without scaling
+  shrinks it.
+- **A ring does NOT close on itself, and testing that it does switches the
+  offset off on every real file.** Slicers stop the last bead short of the seam:
+  measured over all 308 candidate loops of two real slices, every one lands
+  0.0385–0.0411 mm short and none within 1e-6. `move_walls` accepts a gap under
+  one stated bead width, and sets the closing vertex to
+  `offset[0] + (closes − entry)` so the gap survives — offsetting it by its own
+  normal loses the whole offset and can run the bead past its own seam. Do NOT
+  tighten either back: it took the Benchy from 0 to 14452 moved outer beads.
 - **The layer laid on the bed is never raised, and a column climbs to its offset
   over `RAMP` (2) layers.** A bead on the plate is not pressed by the nozzle, so
   the flow a raise needs spreads sideways instead of building height — it filled
@@ -154,10 +210,14 @@ Peak RSS is flat at ~14 MiB on a 307 MB input.
   `extrusion_factor` is one formula,
   `(layer_height + rise(k) - rise(k-1)) / layer_height`, covering the bed, the
   climb, the steady state and the cap. Do not special-case any of them back.
-- **Every number that reaches the nozzle is checked at the boundary.** `cli::within`
-  refuses a value that is not finite and in range, and a layer height is filtered
-  by `scan::is_a_height` at every place it can arrive: CLI, slicer environment,
-  bgcode metadata and the survey.
+- **Every number that reaches the nozzle is checked where it is read.** The
+  binary takes a file plus `--output`/`--verbose`/`--force` and `--extra-flow`,
+  and nothing else — no sub-command (pinned by
+  `cli::the_whole_command_line_is_a_file_three_flags_and_a_dial` and
+  `cli::the_brick_sub_command_is_gone`) — so a
+  height is filtered by `scan::is_a_height` at every place it can arrive —
+  slicer environment, bgcode metadata, the file's settings block and the survey
+  — and a width by `scan::width` plus `automatic_flow`'s own guards.
 
 ## Conventions
 

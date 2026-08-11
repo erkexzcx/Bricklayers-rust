@@ -28,6 +28,11 @@ pub struct Settings {
     /// Arc fitting emits extrusions as `G2`/`G3`, which neither transform can
     /// reshape.
     pub arc_fitting: Option<bool>,
+    /// Nozzle diameter in mm.
+    pub nozzle: Option<f64>,
+    /// Width the internal perimeters are metered at, in mm, resolved against
+    /// the nozzle where the profile states it as a percentage.
+    pub wall_width: Option<f64>,
     /// Where the slicer will finally put the file. Post-processing scripts are
     /// handed a temporary path, so this is the only name the user recognises.
     pub output_name: Option<String>,
@@ -49,6 +54,8 @@ impl Settings {
             })
         };
 
+        let nozzle = crate::scan::width(get(&["nozzle_diameter"]).as_deref(), None);
+
         Self {
             layer_height: get(&["layer_height"])
                 .and_then(|value| value.parse::<f64>().ok())
@@ -63,6 +70,11 @@ impl Settings {
             arc_fitting: get(&["arc_fitting", "enable_arc_fitting"])
                 .as_deref()
                 .map(arc_fitting),
+            nozzle,
+            wall_width: crate::scan::width(
+                get(&["perimeter_extrusion_width", "inner_wall_line_width"]).as_deref(),
+                nozzle,
+            ),
             output_name: get(&["pp_output_name"]),
         }
     }

@@ -12,7 +12,7 @@ assignees: ''
 
 ## Files (required for any G-code issue)
 
-If this is about how `brick` reads or rewrites G-code, the issue cannot be
+If this is about how the G-code is read or rewritten, the issue cannot be
 investigated without the files. Attach them by dragging them into this box — zip them
 first if GitHub rejects the extension.
 
@@ -23,7 +23,7 @@ first if GitHub rejects the extension.
 ## Command
 
 ```
-bricklayers brick --extrusion-multiplier 1.05 --verbose --output out.gcode part.gcode
+bricklayers --verbose --output out.gcode part.gcode
 ```
 
 <!-- Paste the exact command you ran and its output. -->

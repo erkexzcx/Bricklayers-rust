@@ -27,7 +27,6 @@ The gaps are the one thing drawn far larger than life — on a 0.2 mm layer they
 - [🚀 Install](#-install)
 - [🖨️ Use](#️-use)
 - [📐 How much flow it adds](#-how-much-flow-it-adds)
-- [📄 Licence](#-licence)
 
 ---
 
@@ -222,9 +221,3 @@ Published micro-CT work supports the direction, though none of it was used to fi
 - Guessasma, S., Belhabib, S. & Altin, A. **“On the Tensile Behaviour of Bio-Sourced 3D-Printed Structures from a Microstructural Perspective.”** *Polymers* **12**, 1060 (2020). [doi:10.3390/polym12051060](https://doi.org/10.3390/polym12051060) — overall porosity of 3D-printed PLA measured at **5.73%** by micro-CT, and the paper notes the same quantity comes out near **11%** when taken from weight and volume instead.
 
 Both report the void a print has *before* anything is staggered, at a resolution far coarser than the corner this tool feeds. They are evidence that the corner is real and that it grows with layer height against nozzle size, which is exactly what the formula above scales with.
-
----
-
-## 📄 Licence
-
-GPL-3.0-or-later, matching the project that inspired it.

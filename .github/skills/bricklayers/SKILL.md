@@ -227,6 +227,28 @@ Four consequences that are easy to get backwards:
    nothing, which is just "scale the raised loops only" at twice the rate.
    There is no uniform-plus-edge-correction solution to those rules.
 
+   **The wall facing the infill is NOT moved outward by the mirror of this, and
+   the reason is the slack that is already there.** The arithmetic is
+   symmetric — offset the innermost loop by the same `skin_offset()` with the
+   sign flipped and its inner face lands exactly where the slicer drew it — but
+   the two faces are not comparable. The visible wall's outer face has no
+   slack: it is the part's dimension. The innermost wall's inner face has slack
+   the slicer chose. Measured on a stock 2-wall OrcaSlicer Benchy
+   (`target/tmp/infill_gap.py`, nearest separately-metered material to every
+   internal-wall sample, per layer): the gap peaks hard at **0.34 to 0.36 mm**
+   against the 0.39 to 0.41 mm two beads touching would give, i.e. the slicer
+   already runs infill **0.04 to 0.06 mm inside the wall's centreline** — the
+   file's own `infill_wall_overlap = 15%`. What the mirror move would correct
+   is `(flow − 1)/2 × spacing` = **5.1 µm** at the derived 1.025, a tenth of a
+   slack that is a dial on the slicer's own page.
+
+   It is also not reliably the loop that faces infill. On that same Benchy
+   **9.3% of internal wall path has no separately-metered material within
+   2 mm** of it — the hull is thin enough there that two wall bands meet — and
+   on the 1000-wall version it is 56.6%. Those loops face a staggered
+   wall-to-wall joint, and pinning both edges of a band is exactly what starves
+   one. Do not reopen this without a sectioned print.
+
    **None of this is measured yet.** Whether a void opens at the staggered
    joint, and how big it is, has never been checked against a sectioned print.
    The offset is a defensible construction, not a finding. Anything built on

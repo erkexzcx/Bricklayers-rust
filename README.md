@@ -230,7 +230,6 @@ Against [GeekDetour/BrickLayers](https://github.com/GeekDetour/BrickLayers) and 
 - 🔧 **No slicer settings to change first** — arc fitting stays on, wall order is read rather than dictated, and `.bgcode` is read and written natively with thumbnails and config copied byte for byte.
 - 🧵 **No stringing from the raise** — a height change rides a travel the printer was already making, instead of stopping the toolhead over a seam with a primed nozzle.
 - 🧩 **Two walls are enough, and the visible wall is in on it** — a region with one internal loop is bricked against the wall you can see; that wall takes the same flow as every other and is drawn back in by half of what it gains.
-- ⚡ **Fast** — an 18 MB, 925-layer slice takes 1.3 s at 14.0 MiB through `--bricks`, 15.7 s at 43.9 MiB through both; adaptive layer height, absolute extrusion and sequential printing are each metered for what they are.
 
 Against [Theaninova/GCodeZAA](https://github.com/Theaninova/GCodeZAA), the post-processor that Z anti-aliasing started as:
 

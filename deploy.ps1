@@ -1,9 +1,9 @@
 <#
-Install the latest bricklayers release:
+Install the latest corbel release:
 
-    irm https://raw.githubusercontent.com/erkexzcx/Bricklayers-rust/main/deploy.ps1 | iex
+    irm https://raw.githubusercontent.com/erkexzcx/corbel/main/deploy.ps1 | iex
 
-Set BRICKLAYERS_DIR to install somewhere other than %USERPROFILE%\BrickLayers, and GITHUB_TOKEN
+Set CORBEL_DIR to install somewhere other than %USERPROFILE%\corbel, and GITHUB_TOKEN
 if the unauthenticated GitHub API rate limit gets in the way.
 #>
 
@@ -13,9 +13,9 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$repo = 'erkexzcx/Bricklayers-rust'
-$installDir = if ($env:BRICKLAYERS_DIR) { $env:BRICKLAYERS_DIR } else { Join-Path $HOME 'BrickLayers' }
-$userAgent = 'bricklayers-deploy'
+$repo = 'erkexzcx/corbel'
+$installDir = if ($env:CORBEL_DIR) { $env:CORBEL_DIR } else { Join-Path $HOME 'corbel' }
+$userAgent = 'corbel-deploy'
 
 # PROCESSOR_ARCHITECTURE reports the shell's own architecture, so an x86 PowerShell on an arm64
 # machine only shows the real one in PROCESSOR_ARCHITEW6432.
@@ -36,16 +36,16 @@ try {
 $tag = $release.tag_name
 if (-not $tag) { throw 'the latest release has no tag name.' }
 
-$assetName = "bricklayers_${tag}_${platform}.exe"
+$assetName = "corbel_${tag}_${platform}.exe"
 $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
 if (-not $asset) { throw "release $tag publishes no asset named $assetName." }
 
-$sumsName = "bricklayers_${tag}_SHA256SUMS.txt"
+$sumsName = "corbel_${tag}_SHA256SUMS.txt"
 $sumsAsset = $release.assets | Where-Object { $_.name -eq $sumsName } | Select-Object -First 1
 
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('bricklayers.' + [IO.Path]::GetRandomFileName())
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ('corbel.' + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null
-$binary = Join-Path $installDir 'bricklayers.exe'
+$binary = Join-Path $installDir 'corbel.exe'
 try {
     $download = Join-Path $tmp $assetName
     Write-Host "Downloading $assetName..."
@@ -104,21 +104,25 @@ whoever manages this PC, and only they can allow the file.
 "@
         # Not `exit`: this script is meant to be run through `irm | iex`, where exiting closes
         # the window on top of the explanation.
-        throw 'Windows App Control blocked bricklayers.exe - see above.'
+        throw 'Windows App Control blocked corbel.exe - see above.'
     }
-    $version = "bricklayers $tag"
+    $version = "corbel $tag"
 }
 
 Write-Host @"
 
 Installed $version to $binary
 
-Add this to your slicer - PrusaSlicer: Print Settings -> Output options -> Post-processing
-scripts, Orca/Bambu Studio: Others -> Post-processing Scripts:
+corbel has two transforms and you have to name at least one, so paste one of these lines
+into your slicer - PrusaSlicer: Print Settings -> Output options -> Post-processing scripts,
+Orca/Bambu Studio: Others -> Post-processing Scripts:
 
-    "$binary"
+    "$binary" --bricks --zaa      # both (start here)
+    "$binary" --bricks            # BrickLayers only: interlock the walls
+    "$binary" --zaa               # Z anti-aliasing only: ramp the shallow tops
 
-Keep the quotes. The slicer appends the G-code path itself. Nothing else needs setting: the
-layer height, the line width and the flow are all read from the file. Bricking needs two walls
-or more; three or more interlocks twice as much.
+Keep the quotes, and paste only the command - not the comment after it. The slicer appends the
+G-code path itself. Nothing else needs setting: the layer height, the line width and the flow
+are all read from the file. Bricking needs two walls or more; three or more interlocks twice as
+much. Run '$binary --help' for the options.
 "@

@@ -24,11 +24,25 @@ impl Params {
         window: 12,
         lookahead: 4,
     };
+
+    /// The most bytes one stored byte can unpack to. A back reference is the
+    /// only way to gain: it spends a tag bit plus a window and a lookahead
+    /// field to name at most `2^lookahead` bytes, and a literal costs nine bits
+    /// for eight. Rounded up, so a stream sitting exactly on the bound still
+    /// decodes — 8:1 for W11, where the arithmetic is exact, and 7.53:1 for
+    /// W12.
+    pub fn expansion(self) -> usize {
+        let longest = 1usize << self.lookahead;
+        (longest * 8).div_ceil(1 + self.window as usize + self.lookahead as usize)
+    }
 }
 
 /// Returns `None` if the stream ends before `expected` bytes are produced.
 pub fn decode(source: &[u8], params: Params, expected: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(expected);
+    // `expected` is four bytes out of the file, so only what this many stored
+    // bytes could actually produce is reserved for.
+    let room = expected.min(source.len().saturating_mul(params.expansion()));
+    let mut out = Vec::with_capacity(room);
     let mut bits = Reader {
         bytes: source,
         at: 0,
@@ -236,6 +250,27 @@ mod tests {
         round_trip(b"a", Params::W12);
         round_trip(&[0u8; 5000], Params::W12);
         round_trip(&[0xFFu8; 33], Params::W11);
+    }
+
+    /// The bound an uncompressed length out of the file is checked against.
+    /// One repeated byte is the best a back reference can do, so a stream of it
+    /// is what would break a bound that is too tight; a length past the bound
+    /// must be refused rather than reserved for, because reserving for it is
+    /// what aborts the process.
+    #[test]
+    fn expansion_bounds_what_a_stream_can_produce() {
+        for params in [Params::W11, Params::W12] {
+            let data = vec![b'x'; 1 << 16];
+            let encoded = encode(&data, params);
+            assert!(
+                data.len() <= encoded.len() * params.expansion(),
+                "{params:?}: {} bytes from {}",
+                data.len(),
+                encoded.len()
+            );
+            assert_eq!(decode(&encoded, params, data.len()), Some(data));
+            assert_eq!(decode(&encoded, params, usize::MAX), None, "{params:?}");
+        }
     }
 
     #[test]

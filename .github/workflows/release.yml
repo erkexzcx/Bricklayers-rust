@@ -116,7 +116,7 @@ jobs:
         run: |
           # The published tag is the only version this project has; a build from source
           # has no release behind it and reports "dev" instead.
-          export BRICKLAYERS_VERSION="${TAG_NAME#v}"
+          export CORBEL_VERSION="${TAG_NAME#v}"
           cargo ${CARGO_COMMAND} --release --locked --offline --target "${TARGET}"
 
       - name: Name release asset
@@ -129,9 +129,9 @@ jobs:
           SUFFIX: ${{ matrix.suffix }}
         run: |
           # Assets are shipped uncompressed so deploy.sh can curl one straight onto disk.
-          asset_name="bricklayers_${TAG_NAME}_${OS_NAME}_${ARCH}${SUFFIX}"
+          asset_name="corbel_${TAG_NAME}_${OS_NAME}_${ARCH}${SUFFIX}"
           mkdir -p dist
-          cp "target/${TARGET}/release/bricklayers${SUFFIX}" "dist/${asset_name}"
+          cp "target/${TARGET}/release/corbel${SUFFIX}" "dist/${asset_name}"
           chmod 755 "dist/${asset_name}"
           echo "asset_name=${asset_name}" >> "$GITHUB_OUTPUT"
 
@@ -206,7 +206,7 @@ jobs:
         env:
           TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          checksum_name="bricklayers_${TAG_NAME}_SHA256SUMS.txt"
+          checksum_name="corbel_${TAG_NAME}_SHA256SUMS.txt"
           (
             cd dist
             sha256sum * > "${checksum_name}"

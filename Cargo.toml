@@ -1,11 +1,11 @@
 [package]
-name = "bricklayers"
+name = "corbel"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 license = "GPL-3.0-or-later"
-description = "G-code post-processor that interlocks perimeters between layers, like laying bricks"
-repository = "https://github.com/erkexzcx/Bricklayers-rust"
+description = "G-code post-processor with two transforms: BrickLayers, which interlocks perimeters between layers, and Z anti-aliasing, which smooths the staircase off shallow surfaces"
+repository = "https://github.com/erkexzcx/corbel"
 readme = "README.md"
 keywords = ["3d-printing", "gcode", "slicer", "post-processing", "cli"]
 categories = ["command-line-utilities"]

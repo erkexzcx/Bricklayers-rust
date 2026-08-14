@@ -16,10 +16,17 @@ pub enum Error {
     Bgcode { path: PathBuf, reason: String },
 
     #[error(
-        "{path} has already been bricked; running again would stack a second shift on \
+        "{path} does not read as G-code: {saw}. corbel rewrites the file it is \
+         given, so it will not touch one it cannot recognise; point it at a \
+         sliced .gcode or .bgcode file, or pass --force if that is what you want"
+    )]
+    NotGcode { path: PathBuf, saw: String },
+
+    #[error(
+        "{path} has already been {done}; running again would stack a second pass on \
          the first. Re-slice, or pass --force if that is what you want"
     )]
-    AlreadyProcessed { path: PathBuf },
+    AlreadyProcessed { path: PathBuf, done: &'static str },
 }
 
 impl Error {

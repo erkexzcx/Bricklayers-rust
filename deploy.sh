@@ -1,16 +1,16 @@
 #!/bin/bash
 #
-# Install the latest bricklayers release:
+# Install the latest corbel release:
 #
-#     curl -fsSL https://raw.githubusercontent.com/erkexzcx/Bricklayers-rust/main/deploy.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/erkexzcx/corbel/main/deploy.sh | bash
 #
-# Set BRICKLAYERS_DIR to install somewhere other than ~/BrickLayers, and GITHUB_TOKEN if the
+# Set CORBEL_DIR to install somewhere other than ~/corbel, and GITHUB_TOKEN if the
 # unauthenticated GitHub API rate limit gets in the way.
 
 set -euo pipefail
 
-repo="erkexzcx/Bricklayers-rust"
-install_dir="${BRICKLAYERS_DIR:-${HOME}/BrickLayers}"
+repo="erkexzcx/corbel"
+install_dir="${CORBEL_DIR:-${HOME}/corbel}"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -46,7 +46,7 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     curl_args+=(--header "Authorization: Bearer ${GITHUB_TOKEN}")
 fi
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/bricklayers.XXXXXX")"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/corbel.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 printf 'Looking up the latest release of %s...\n' "$repo"
@@ -66,11 +66,11 @@ release="$(cat "${tmp}/release.json")"
 tag="$(jq -r '.tag_name // empty' <<<"$release")"
 [[ -n "$tag" ]] || die "the latest release has no tag name."
 
-asset="bricklayers_${tag}_${platform}"
+asset="corbel_${tag}_${platform}"
 asset_url="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")"
 [[ -n "$asset_url" ]] || die "release ${tag} publishes no asset named ${asset}."
 
-sums="bricklayers_${tag}_SHA256SUMS.txt"
+sums="corbel_${tag}_SHA256SUMS.txt"
 sums_url="$(jq -r --arg name "$sums" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")"
 
 printf 'Downloading %s...\n' "$asset"
@@ -87,22 +87,26 @@ else
 fi
 
 mkdir -p "$install_dir"
-binary="${install_dir}/bricklayers"
+binary="${install_dir}/corbel"
 mv -f "${tmp}/${asset}" "$binary"
 chmod 755 "$binary"
 
-version="$("$binary" --version 2>/dev/null || printf 'bricklayers %s' "$tag")"
+version="$("$binary" --version 2>/dev/null || printf 'corbel %s' "$tag")"
 
 cat <<EOF
 
 Installed ${version} to ${binary}
 
-Add this to your slicer — PrusaSlicer: Print Settings -> Output options -> Post-processing
-scripts, Orca/Bambu Studio: Others -> Post-processing Scripts:
+corbel has two transforms and you have to name at least one, so paste one of these lines
+into your slicer — PrusaSlicer: Print Settings -> Output options -> Post-processing scripts,
+Orca/Bambu Studio: Others -> Post-processing Scripts:
 
-    ${binary}
+    ${binary} --bricks --zaa      # both (start here)
+    ${binary} --bricks            # BrickLayers only: interlock the walls
+    ${binary} --zaa               # Z anti-aliasing only: ramp the shallow tops
 
-The slicer appends the G-code path itself. Nothing else needs setting: the layer height, the
-line width and the flow are all read from the file. Bricking needs two walls or more; three or
-more interlocks twice as much. Run '${binary} --help' for the options.
+The slicer appends the G-code path itself, and the comment after each line is not part of it.
+Nothing else needs setting: the layer height, the line width and the flow are all read from the
+file. Bricking needs two walls or more; three or more interlocks twice as much. Run
+'${binary} --help' for the options.
 EOF

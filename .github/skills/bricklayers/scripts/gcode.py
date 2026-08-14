@@ -1,4 +1,4 @@
-"""Shared G-code reading for the bricklayers audit scripts.
+"""Shared G-code reading for corbel's audit scripts.
 
 Mirrors what src/brick.rs does, so a measurement taken here says something
 about the transform rather than about this parser. In particular: regions end
@@ -24,7 +24,7 @@ WORD = re.compile(r"(?:^|\s)([XYZEF])(-?\d*\.?\d+)")
 
 
 def classify(label: str) -> str:
-    """Region kind, matching src/feature.rs. Order matters."""
+    """Region kind, matching src/gcode/feature.rs. Order matters."""
     low = label.strip().lower()
     # Before the wall tests: "Overhang perimeter" carries both words. An
     # overhang is labelled in place of the wall it belongs to and names no
@@ -210,7 +210,7 @@ def regions(path: str, kind: str = "internal"):
             feature = found
             travelled = True
             continue
-        ours = "bricklayers" in line
+        ours = "corbel" in line
         body = line.split(";")[0].strip()
         arc = body[:2] in ("G2", "G3")
         linear = body[:2] in ("G0", "G1")

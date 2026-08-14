@@ -19,11 +19,11 @@
 
 use std::io::{self, BufRead, Write};
 
-use crate::feature::{Feature, is_layer_marker};
-use crate::footprint::{self, Arc, Cells};
-use crate::gcode::{Code, Extruder, Line, Lines, write_e};
-use crate::inset::Edge;
-use crate::scan::{BRICK_STAMP, FALLBACK_Z_FEEDRATE, Survey, is_a_height};
+use crate::gcode::feature::{Feature, is_layer_marker};
+use crate::gcode::{Code, Extruder, Line, Lines, MAX_LINE, Modal, repaired, write_e};
+use crate::geometry::Edge;
+use crate::geometry::{Arc, Cells, Trace, footprint, inset};
+use crate::scan::{BRICK_STAMP, FALLBACK_Z_FEEDRATE, Markerless, Survey, is_a_height};
 
 /// How far apart two loops may run and still count as neighbours in one wall,
 /// in mm.
@@ -42,6 +42,42 @@ const MAX_LOOP_GAP: f64 = 2.0;
 /// handful covers the loop that runs on past the end of the one it followed,
 /// which is what a wall does wherever it widens.
 const PROBES: usize = 16;
+
+/// How far apart, in mm of path, an arc is sampled when a loop is measured or
+/// probed.
+///
+/// A `G2`/`G3` states only where it ends, so a loop read off its endpoints
+/// alone is read off its chords: two concentric arc-fitted loops a bead apart
+/// whose slicer cut them at different angles then measure a chord's bulge
+/// apart rather than a bead. At a 10 mm radius a 45° disagreement puts their
+/// endpoints 7.5 mm from each other, far past [`MAX_LOOP_GAP`], so every loop
+/// of a curved wall became a contour of its own and the whole stagger was lost
+/// — which is every curved wall a slicer with arc fitting on emits, and that
+/// is the Bambu Studio default. A quarter of the gap being tested leaves the
+/// worst sampling error an eighth of it, and it is about the spacing a slicer
+/// puts between the vertices of a loop it did *not* fit an arc to, so a curved
+/// wall is probed no more finely than a straight one.
+const ARC_STEP: f64 = MAX_LOOP_GAP / 4.0;
+
+/// How much of one loop's probed path has to run within [`MAX_LOOP_GAP`] of
+/// another before the two are taken for loops of the same wall.
+///
+/// A wall's loops are the last one offset inwards, so nearly every point of
+/// one lies a bead width from the other; where one runs on past the end of the
+/// one it followed, the shorter of the two is still beside the longer along
+/// the whole of itself, which is why the share is measured both ways round and
+/// the better answer taken.
+///
+/// A second wall passing close by is not like that. A hole's loop running
+/// beside an island's touches it over a short stretch and leaves the rest of
+/// itself elsewhere: a 5 mm hole 1.2 mm from a straight wall has a quarter of
+/// its path within the gap. Asking only whether the two come close *anywhere*
+/// pulled the hole into the island's contour, where its loops were ordered by
+/// their distance to the island's visible wall — a distance that drifts layer
+/// to layer on anything tapered or curved, so the hole's stagger flipped from
+/// one layer to the next, and the hole's own visible wall was left in a
+/// contour of its own that is never raised.
+const BESIDE_SHARE: f64 = 0.5;
 
 /// Layers a raised column takes to climb to its full offset.
 ///
@@ -76,17 +112,32 @@ const RAMP: usize = 2;
 /// uncovered end to end.
 const CAP_SHARE: f64 = 0.75;
 
+/// How much of a loop's path has to stand on what the layer below left proud
+/// before the loop is metered as being laid on a raise.
+///
+/// A different question from [`CAP_SHARE`] and biased the other way. Getting
+/// this wrong in the direction of "there is no raise under me" feeds a bead
+/// for a whole layer of gap when the raise below has already filled half of
+/// it — twice the material the gap can hold — while getting it wrong the other
+/// way leaves a bead a little short, which an internal wall absorbs. So it
+/// sits low.
+///
+/// It can sit low because the two populations barely touch. Measured over two
+/// real Benchy slices, 95% to 99% of loops laid on the plane share a tenth of
+/// their path or less with the raise below, while a loop carrying a raised
+/// column on has 0.4 to 1.0 of its path over one — the wall shifts sideways as
+/// it climbs, so even an unbroken column rarely reaches 1.0. The valley
+/// between the two is empty, and [`CAP_SHARE`] would cut straight through the
+/// upper population.
+const SEAM_SHARE: f64 = 0.25;
+
 /// Most lines held back between one region's last bead and the next region's
-/// first, so that a wall's opening travel can carry its height.///
+/// first, so that a wall's opening travel can carry its height.
+///
 /// A real lead is a handful of lines — a travel, a hop restore, a prime and
 /// the markers. The cap is what keeps the promise that nothing larger than one
 /// region is ever buffered, whatever a file puts between two extrusions.
 const TAIL: usize = 64;
-
-/// How close two of a loop's vertices have to be to count as the same point,
-/// in mm. G-code coordinates carry three decimals, so anything under a micron
-/// is the same place written twice.
-const COINCIDENT: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -211,6 +262,14 @@ fn flow_ceiling(height: f64, spacing: f64) -> f64 {
     2.0 - height * (1.0 - std::f64::consts::FRAC_PI_4) / spacing
 }
 
+/// The most [`flow_ceiling`] approaches on any geometry, which is what bounds
+/// a flow a caller pinned on a file that states no width to solve one against.
+///
+/// The ceiling subtracts a positive term from 2 for every layer a printer
+/// lays, so it is under 2 everywhere and reaches 2 only in the limit of an
+/// infinitely thin one.
+const FLOW_LIMIT: f64 = 2.0;
+
 /// Flow to meter a wall at, for a layer of `height` printed at `width`, where
 /// a layer as thick as the nozzle would take `extra` over.
 ///
@@ -254,11 +313,31 @@ impl Config {
     ///
     /// [`Config::wall_flow`] where a caller pinned one, and otherwise what the
     /// geometry asks for at the slope [`Config::extra_flow`] names.
+    ///
+    /// A pinned flow reaches the nozzle by the same road as a derived one, so
+    /// it is held to the same bounds rather than taken on trust. One that is
+    /// not a number puts NaN in an `E` word; one under 1 takes material off
+    /// every wall while [`Pass::skin_offset`] turns negative, so
+    /// [`Pass::move_walls`] gives up and the visible wall is scaled without
+    /// being moved — which is the case that grows the part. The ceiling is the
+    /// bead model's own, and where the file states no geometry to solve it
+    /// against, the limit it approaches stands in.
     fn flow_at(&self, height: f64, width: Option<f64>) -> f64 {
-        match self.wall_flow {
-            Some(pinned) => pinned,
-            None => automatic_flow(height, width, self.extra_flow),
+        let Some(pinned) = self.wall_flow else {
+            return automatic_flow(height, width, self.extra_flow);
+        };
+        if !pinned.is_finite() {
+            return 1.0;
         }
+        let ceiling = width
+            .filter(is_a_height)
+            .filter(|_| is_a_height(&height))
+            .map(|width| bead_spacing(height, width))
+            .filter(is_a_height)
+            .map(|spacing| flow_ceiling(height, spacing))
+            .unwrap_or(FLOW_LIMIT);
+        // Not `clamp`, which panics where the geometry puts the ceiling under 1.
+        pinned.min(ceiling).max(1.0)
     }
 }
 
@@ -272,6 +351,9 @@ pub struct Stats {
     /// where nothing was raised. The two differ only on an adaptive slice.
     pub raise: Option<(f64, f64)>,
     pub layers: usize,
+    /// Perimeter loops seen, the visible wall included and fillers excluded.
+    /// Only the hidden ones can ever be raised, so this is about twice the
+    /// pool [`Stats::raised`] is drawn from.
     pub loops: usize,
     pub raised: usize,
     /// Loops laid flat because nothing stood on them, which would otherwise
@@ -308,8 +390,29 @@ pub fn stream<R: BufRead, W: Write>(
     let mut pass = Pass::new(writer, config, survey);
     let mut lines = Lines::new(reader);
     while let Some(raw) = lines.next_line()? {
-        pass.feed(raw)?;
+        // A line no reader will hold whole arrives in pieces, and asking which
+        // costs a copy: the text just handed over borrows the reader it would
+        // be asked of. Every piece of such a line is about the cap long, so
+        // nothing shorter can open one — and the line every real file is made
+        // of never asks a second question. Once one is open the question has
+        // to be asked of every line, because the piece that closes it can be
+        // a few bytes short of the cap.
+        if !pass.spilling && raw.text.len() < MAX_LINE {
+            pass.feed(raw.text, raw.bytes)?;
+            continue;
+        }
+        let held = raw.bytes.to_owned();
+        // The last piece of a long line is partial too — it was assembled out
+        // of what the read before it carried over — so anything answering no
+        // is a line of its own, and the one before it is finished.
+        if lines.partial() {
+            pass.spill(&held)?;
+            continue;
+        }
+        pass.rejoin()?;
+        pass.feed(&repaired(&held), &held)?;
     }
+    pass.rejoin()?;
     pass.flush()?;
     pass.out.flush()?;
 
@@ -358,22 +461,56 @@ struct Buffered {
     delta: Option<f64>,
     z: Option<f64>,
     f: Option<f64>,
+    /// Where the move names both of its coordinates, which is what a travel
+    /// has to name to be handed a whole new corner: what a move leaves unnamed
+    /// it inherits, and the line ahead of a loop is not one of the loop's own
+    /// vertices to inherit from.
     xy: Option<(f64, f64)>,
+    /// True where the line names an `X`, a `Y` or both, which is whether a new
+    /// place can be written into it at all. A bead running along one axis names
+    /// one word and is still a vertex of its loop: the axis it leaves out it
+    /// inherits from the bead before it, which the offset has already moved
+    /// onto the new ring.
+    places: bool,
     /// Where the move ends, with the axes it left unnamed carried forward, so
     /// a loop's path can be walked without re-reading the region.
     at: (f64, f64),
     /// Centre and direction of a `G2`/`G3`, so its path is followed round
-    /// rather than cut across.
+    /// rather than cut across. Resolved from wherever the move started, so an
+    /// `R`-form arc — which names a radius and no centre at all — is followed
+    /// round the same curve as an `I`/`J` one.
     arc: Option<Arc>,
+    /// True where the line is a `G2`/`G3`, whatever came of reading its
+    /// centre. An arc whose centre could not be resolved is not a straight
+    /// move: the two ends are where the slicer put them and everything
+    /// between them is not, so a loop holding one is left exactly as sliced
+    /// rather than moved along a chord it was never drawn on.
+    curved: bool,
     extrudes: bool,
+    /// True where the line names an `X` or a `Y`, so it is the one that
+    /// settles where in the plane the nozzle goes next. A height move after it
+    /// leaves the nozzle exactly where it left it.
+    steers: bool,
     /// True where the line decides where the nozzle is next, so nothing after
     /// it in a lead can undo a height set on it.
     positions: bool,
     /// True where a height change can ride this line instead of stopping the
     /// toolhead for one of its own. Extrusions and wipes are excluded — their
-    /// path is laid against the layer below — and so is a line that already
-    /// carries a comment, which is where the stamp has to go.
+    /// path is laid against the layer below.
+    ///
+    /// A comment does not exclude one. Slicers that annotate their moves put
+    /// one on every travel, and refusing those left every loop of such a file
+    /// with a `G1 Z` of its own; the stamp goes in front of whatever the line
+    /// already said instead, which is where a reader looks for it.
     carries: bool,
+    /// The `E` convention this line's own words were read in.
+    ///
+    /// A `M82`/`M83` names no coordinate and no filament, so it is held with
+    /// the region around it and only reaches the printer when that region is
+    /// written. Until then the switch has not happened in the stream being
+    /// written, and a bead metered back out in the convention that follows it
+    /// turns an absolute position into a relative delta.
+    absolute: bool,
     /// True where the line is a `G92`, whose `E` is an origin rather than a
     /// demand for filament and so reaches the output stream only when the
     /// line is written.
@@ -391,6 +528,91 @@ struct Moved {
     ratio: f64,
 }
 
+/// Samples one arc may be cut into. A corrupt `I`/`J` can name a radius no
+/// bed holds, and a walk metered in millimetres of it would not end; at
+/// [`ARC_STEP`] this ceiling is two kilometres of path.
+const MAX_ARC_SAMPLES: usize = 4096;
+
+/// The points one extruding move lays down: an arc followed round its own
+/// curve at [`ARC_STEP`], and the end point of anything else.
+///
+/// Written out rather than collected so a loop can be probed against every
+/// other loop of its region without allocating once per arc per comparison.
+struct Along {
+    /// Centre, radius, opening angle and signed sweep, as [`footprint::turn`]
+    /// reports them. `None` for a straight move.
+    turn: Option<((f64, f64), f64, f64, f64)>,
+    steps: usize,
+    step: usize,
+    end: (f64, f64),
+}
+
+impl Along {
+    fn new(from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> Self {
+        let turn = arc.and_then(|arc| footprint::turn(from, to, arc));
+        let steps = match turn {
+            Some((_, radius, _, sweep)) => {
+                let length = radius * sweep.abs();
+                ((length / ARC_STEP).ceil() as usize).clamp(1, MAX_ARC_SAMPLES)
+            }
+            None => 1,
+        };
+        Self {
+            turn,
+            steps,
+            step: 1,
+            end: to,
+        }
+    }
+
+    /// A move that lays nothing down.
+    fn nowhere() -> Self {
+        Self {
+            turn: None,
+            steps: 0,
+            step: 1,
+            end: (0.0, 0.0),
+        }
+    }
+}
+
+impl Iterator for Along {
+    type Item = (f64, f64);
+
+    fn next(&mut self) -> Option<(f64, f64)> {
+        let step = self.step;
+        if step > self.steps {
+            return None;
+        }
+        self.step += 1;
+        // The last sample is the move's own end point, taken from the file
+        // rather than from the angle, so a loop still closes where the slicer
+        // closed it however the arc was sampled.
+        if step == self.steps {
+            return Some(self.end);
+        }
+        let (centre, radius, start, sweep) = self.turn?;
+        let angle = start + sweep * step as f64 / self.steps as f64;
+        Some((
+            centre.0 + radius * angle.cos(),
+            centre.1 + radius * angle.sin(),
+        ))
+    }
+}
+
+/// True for a region a slicer lays between the loops of a wall rather than as
+/// one of them.
+///
+/// Gap fill goes where two loops could not both fit; a thin wall is what the
+/// wall becomes where it narrows to less than two beads. Both arrive in the
+/// middle of a wall, both have to be buffered with it so its loops stay in one
+/// contour, and neither may be raised: a thin wall's two faces are both the
+/// visible one, so half a layer of step on it is half a layer of step on the
+/// outside of the part.
+fn is_filler(feature: Feature) -> bool {
+    matches!(feature, Feature::GapFill | Feature::ThinWall)
+}
+
 /// One perimeter loop, as index ranges into the buffer. `lead` covers the
 /// travel that reaches the loop, `body` the extrusions themselves.
 #[derive(Clone, Copy)]
@@ -400,6 +622,11 @@ struct Loop {
     /// One past this loop's last buffered line, known only once the region is
     /// complete.
     end: usize,
+    /// One past this loop's last extruding line. What lies between it and
+    /// `end` is the tail the slicer wrote after the bead — a retraction, a
+    /// wipe, the travel out of the region — which lays nothing and so must
+    /// never be scaled by the flow the bead was given.
+    beads: usize,
     /// Which contour of the region this loop belongs to, so a contour that
     /// holds only one loop can be told apart from a wall that alternates.
     contour: usize,
@@ -411,6 +638,12 @@ struct Loop {
     /// that is neither is one the slicer only ever called an overhang, and
     /// nothing in the file says which wall that was.
     hidden: bool,
+    /// True where every bead of this loop was laid by a region that fills
+    /// between the wall's loops rather than being one of them — gap fill, or a
+    /// thin wall. It is buffered with the wall so that the loops either side
+    /// of it stay in one contour, but it is not one of them: it takes no place
+    /// in the alternation and is never raised.
+    filler: bool,
     raised: bool,
     /// True where nothing stands on this loop on the next layer, so it has to
     /// finish flat whatever the parity says.
@@ -419,6 +652,15 @@ struct Loop {
     /// begins on this layer, so its first bead climbs from the plane rather
     /// than being raised to an offset nothing under it earned.
     steps: usize,
+    /// True where the material this loop is laid on was left standing proud by
+    /// the layer below. Read off that layer's own footprint rather than
+    /// assumed from this loop's parity, which can differ from the one the
+    /// column had beneath it.
+    on_a_raise: bool,
+    /// True where that raise was a column still climbing rather than one that
+    /// had settled, so it stood at half the offset. Measured for the same
+    /// reason: how old a column is cannot be read off its own loop's age.
+    on_a_climb: bool,
     /// Extent of what the loop extrudes, as `[left, bottom, right, top]`, and
     /// how many points it lays down. Measured once, since grouping compares
     /// every loop with both the one before it and the one after.
@@ -437,7 +679,33 @@ struct Pass<'a, W: Write> {
     /// Where each layer's walls have nothing above them, from the survey.
     uncovered: &'a [Cells],
     unsupported: &'a [Cells],
+    /// Cells the layer below was left standing proud in, so a bead can be
+    /// metered for the gap it really crosses rather than for the one its own
+    /// parity implies.
+    standing: Cells,
+    /// The part of `standing` a column had only climbed half way to. A raise
+    /// reaches its offset over [`RAMP`] layers, so what is under a bead is one
+    /// of exactly two heights, and which one it is has to be measured for the
+    /// same reason the raise itself does.
+    climbed: Cells,
+    /// The same for the layer being written, filled as each loop is settled
+    /// and handed to `standing` when the layer closes.
+    rising: Cells,
+    climbing: Cells,
+    /// Cells of the loop being settled, kept between calls so the walk that
+    /// weighs a loop against the layers either side of it can hand its path
+    /// to `rising` rather than be repeated for it.
+    path: Vec<u32>,
+    /// True once a refused walk has been reported. A print is already running
+    /// by the time this pass sees the file, so a move no printer makes is a
+    /// warning and not a failure — said once, rather than once per loop.
+    warned: bool,
     layer_markers: bool,
+    /// Layer boundaries for a file that carries no marker, driven off the same
+    /// beads the survey drove it off. The two index the same per-layer sets, so
+    /// a rule they did not share exactly would consult them for the wrong
+    /// layer.
+    markerless: Markerless,
     /// Layer height to use where the file measured none, which is every layer
     /// of a file sliced at a fixed height.
     height: f64,
@@ -447,10 +715,18 @@ struct Pass<'a, W: Write> {
     heights: Vec<f64>,
     out: W,
     extruder: Extruder,
+    /// The positioning mode and units every coordinate is read in. A `G91` or
+    /// `G20` section is custom G-code, so it is measured and then written back
+    /// exactly as it was found.
+    modal: Modal,
     feature: Feature,
     layer: usize,
     started: bool,
     layer_z: f64,
+    /// Lowest height this layer has commanded, which is where its beads sit.
+    /// Cleared as each layer opens, and `None` until the layer names a height
+    /// of its own.
+    floor: Option<f64>,
     nozzle_z: Option<f64>,
     /// Rate for the Z moves this pass inserts.
     z_feedrate: f64,
@@ -459,9 +735,17 @@ struct Pass<'a, W: Write> {
     feedrate: Option<f64>,
     /// Text of the region being buffered. Cleared and refilled at each flush,
     /// so it only ever holds one perimeter region.
-    arena: String,
+    arena: Vec<u8>,
     buffer: Vec<Buffered>,
     loops: Vec<Loop>,
+    /// True while the region being written has had the lines the slicer wrote
+    /// after its last bead held back for the layer that follows it. The region
+    /// has not really ended, so nothing is written to settle the nozzle:
+    /// what was held runs before anything else does.
+    holding: bool,
+    /// True while a line too long to be held whole is being copied through in
+    /// pieces, so the newline it is owed has not been written yet.
+    spilling: bool,
     /// Width the visible wall was metered at, in mm, which turns the flow it
     /// gains into the distance it has to be brought toward the loop behind it.
     /// Never absent: a wall that gains material without moving grows the part,
@@ -502,7 +786,14 @@ impl<'a, W: Write> Pass<'a, W> {
             object_tops: survey.object_tops.clone(),
             uncovered: &survey.uncovered,
             unsupported: &survey.unsupported,
+            standing: Cells::on(footprint::Grid::default()),
+            climbed: Cells::on(footprint::Grid::default()),
+            rising: Cells::on(footprint::Grid::default()),
+            climbing: Cells::on(footprint::Grid::default()),
+            path: Vec::new(),
+            warned: false,
             layer_markers: survey.layer_markers,
+            markerless: Markerless::default(),
             height: uniform.unwrap_or(survey.layer_height),
             // A height given on the command line is the one the caller wants
             // used, so it stands in for the measurement rather than beside it.
@@ -512,16 +803,20 @@ impl<'a, W: Write> Pass<'a, W> {
             },
             out,
             extruder: Extruder::new(),
+            modal: Modal::new(),
             feature: Feature::Other,
             layer: 0,
             started: false,
             layer_z: 0.0,
+            floor: None,
             nozzle_z: None,
             z_feedrate: survey.z_feedrate.unwrap_or(FALLBACK_Z_FEEDRATE),
             feedrate: None,
-            arena: String::new(),
+            arena: Vec::new(),
             buffer: Vec::new(),
             loops: Vec::new(),
+            holding: false,
+            spilling: false,
             // The visible wall gains material whether or not the file says how
             // wide it is, and material it gains without being moved grows the
             // part. So the same profile the flow falls back to stands in here:
@@ -549,8 +844,8 @@ impl<'a, W: Write> Pass<'a, W> {
         }
     }
 
-    fn feed(&mut self, raw: &str) -> io::Result<()> {
-        let line = Line::parse(raw);
+    fn feed(&mut self, raw: &str, bytes: &[u8]) -> io::Result<()> {
+        let line = Line::parse_bytes(raw, bytes);
         if let Some(marker) = line.marker() {
             if is_layer_marker(marker) {
                 self.flush()?;
@@ -560,25 +855,49 @@ impl<'a, W: Write> Pass<'a, W> {
                 // a perimeter loop of its own.
                 self.feature = Feature::Other;
                 self.layer += usize::from(std::mem::replace(&mut self.started, true));
-                return self.push(raw);
+                self.close_layer();
+                return self.push(line.origin());
             }
             if let Some(feature) = Feature::from_marker(marker) {
                 // A wall's loops are grouped and numbered as one, so the two
                 // regions a slicer splits it across stay in one buffer: the
                 // visible wall takes its place in the same alternation as the
                 // loops behind it.
-                let continues = self.feature.is_perimeter() && feature.is_perimeter();
+                //
+                // Gap fill is laid where two loops of that same wall could not
+                // both fit, so its region arrives in the middle of the wall
+                // too. Ending the wall there numbers the halves either side of
+                // it separately, and the half without the visible wall in it
+                // falls back to being numbered from a fixed end — which on a
+                // four-loop wall split down the middle inverts it. A thin wall
+                // arrives the same way and for the same reason, where the wall
+                // narrows to less than two beads for a stretch.
+                let with_the_wall = |feature: Feature| feature.is_perimeter() || is_filler(feature);
+                let continues = self.feature.is_perimeter() && feature.is_perimeter()
+                    || !self.loops.is_empty()
+                        && with_the_wall(self.feature)
+                        && with_the_wall(feature);
                 if !self.loops.is_empty() && !continues {
                     self.flush()?;
                 }
                 self.feature = feature;
                 if continues && !self.buffer.is_empty() {
-                    self.buffer(raw, line);
+                    self.buffer(line, self.at);
                     return Ok(());
                 }
-                return self.keep(raw, line, self.at);
+                return self.keep(line, self.at);
             }
         }
+
+        // A `G91` or `G20` section is custom G-code — a colour change, an MMU
+        // swap, a timelapse or a layer-change script — and nothing this pass
+        // writes says what it means inside one. The region is closed while a
+        // plain move still does, so a standing raise is put back before the
+        // section begins.
+        if matches!(line.code, Code::RelativePosition | Code::Inches) && self.modal.is_plain() {
+            self.flush()?;
+        }
+        let moved = self.modal.apply(&line);
 
         match line.code {
             Code::AbsoluteE | Code::RelativeE => self.extruder.set_mode(line.code),
@@ -596,35 +915,114 @@ impl<'a, W: Write> Pass<'a, W> {
                 if let Some(e) = line.e {
                     self.extruder.observe_origin(e);
                 }
+                // The toolhead has not moved and the frame it is named in has,
+                // so the next move starts from where the reset says it stands.
+                let (x, y, _) = self.modal.position();
+                self.at = (x, y);
             }
             _ => {}
         }
 
         // Klipper and Orca without a Z-hop put a layer's Z on the travel that
         // reaches the first loop, which lands inside the buffered region.
-        if let Some(z) = line.z.filter(|_| line.is_move()) {
-            if !self.layer_markers && z > self.layer_z {
-                self.layer += usize::from(std::mem::replace(&mut self.started, true));
-            }
+        if line.z.is_some() && (line.is_move() || line.code == Code::SetPosition) {
+            // Where the move ends, not the number it names: under `G91` a
+            // `G1 Z0.6` is a lift and under `G20` it is 15.24 mm.
+            let z = self.modal.position().2;
             self.layer_z = z;
+            // A Z-hop only ever lifts, and so does a raise this pass inserts,
+            // so the lowest height the layer commands is the plane its beads
+            // sit on. Taking the last one instead hands a lift emitted after
+            // the region's final bead — but before the marker that flushes it
+            // — to every loop of that region, which then prints in the air.
+            // A file with no marker to close a layer on has no run of moves to
+            // take the lowest of: its plane comes from the bead that opened
+            // the layer.
+            if self.layer_markers {
+                self.floor = Some(self.floor.map_or(z, |floor: f64| floor.min(z)));
+            }
+        }
+
+        // Every line of such a section goes straight out: no loop is buffered
+        // from it, nothing rides a height, and no height move is inserted into
+        // it. Only its `E` word is still settled, since the extrusion stream is
+        // a running total that owes nothing to how a coordinate is read. Where
+        // the section leaves the nozzle is still tracked, or the first plain
+        // move after it would be traced from where the toolhead stood before
+        // the section began.
+        if !self.modal.is_plain() {
+            self.flush()?;
+            if let Some((x, y, _)) = moved {
+                self.at = (x, y);
+            }
+            if line.z.is_some() && line.is_move() {
+                self.nozzle_z = Some(self.modal.position().2);
+            }
+            if let Some(rate) = line.f {
+                self.feedrate = Some(rate);
+            }
+            return self.emit(line, 1.0);
+        }
+
+        // Where the file states no layers, the first bead laid off the plane
+        // the last one sat on is what opens the next one. The Z move that
+        // reached it says nothing: a hop lifts and comes back down before
+        // anything is extruded again, so counting Z moves counted every hop as
+        // a layer and walked this pass's layer number away from the survey's.
+        if !self.layer_markers
+            && self.lays_a_bead(&line)
+            && self.markerless.opens_a_layer(self.layer_z)
+        {
+            // Loops still buffered belong to the layer that is ending, and
+            // they have to be written at its plane, metered for its height and
+            // marked against the footprint it left. What the slicer wrote
+            // after that layer's last bead stays: it is the travel this
+            // layer's first raise rides.
+            self.flush_before_a_layer()?;
+            self.layer += usize::from(std::mem::replace(&mut self.started, true));
+            self.close_layer();
+            self.markerless.open(self.layer_z);
         }
 
         // A slicer names only the axes that change, so a move starts wherever
         // the last one left off.
         let from = self.at;
-        if line.draws() {
-            self.at = (line.x.unwrap_or(from.0), line.y.unwrap_or(from.1));
+        if let Some((x, y, _)) = moved {
+            self.at = (x, y);
         }
 
-        if self.feature.is_perimeter() {
+        // Gap fill only joins the buffer where there is a wall in it to keep
+        // whole. Writing it straight out while loops are still buffered would
+        // put it ahead of the loops the slicer laid before it.
+        if self.feature.is_perimeter() || self.fills_a_buffered_wall() {
             if self.buffer.is_empty() {
                 self.entry = from;
             }
-            self.buffer(raw, line);
+            self.buffer(line, from);
             return Ok(());
         }
 
-        self.keep(raw, line, from)
+        self.keep(line, from)
+    }
+
+    /// True where this is a filler region that opened inside a wall this
+    /// pass is still holding, so its beads belong in the buffer with it.
+    fn fills_a_buffered_wall(&self) -> bool {
+        is_filler(self.feature) && !self.loops.is_empty()
+    }
+
+    /// True where this line lays material down, tested exactly as
+    /// [`Survey`] tests it, since the two lay a file with no markers out off
+    /// the same beads.
+    ///
+    /// The extruder is read on a copy: the line has been neither buffered nor
+    /// written, so consuming its delta here would book it twice.
+    fn lays_a_bead(&self, line: &Line<'_>) -> bool {
+        line.draws_in_plane()
+            && line.e.is_some_and(|e| {
+                let mut ahead = self.extruder;
+                ahead.observe(e) > 0.0
+            })
     }
 
     /// Where each buffered line should end up, and by how much its bead's
@@ -639,11 +1037,13 @@ impl<'a, W: Write> Pass<'a, W> {
     ///
     /// An arc moves with the rest: its centre stays put and its radius changes
     /// by the offset, which is what the vertices either end of it are pulled
-    /// onto. Four things it declines, passing the loop through as sliced: an
+    /// onto. Six things it declines, passing the loop through as sliced: an
     /// open fragment, which has no inside; fewer than three points; a loop
     /// whose arcs could not be moved without distorting the circle they were
-    /// drawn on; and the whole of the layer laid on the build plate, where
-    /// there is no staggered joint to close.
+    /// drawn on; a loop holding an arc whose centre could not be read at all;
+    /// a loop nothing in its lead can be given the new start point in; and the
+    /// whole of the layer laid on the build plate, where there is no staggered
+    /// joint to close.
     fn move_walls(&self) -> Vec<Option<Moved>> {
         let mut moved = vec![None; self.buffer.len()];
         let inward = self.skin_offset();
@@ -660,6 +1060,24 @@ impl<'a, W: Write> Pass<'a, W> {
             if beads.len() < 3 {
                 continue;
             }
+            // The travel that reached the loop has to land where it now
+            // starts, or the first bead is drawn from the corner the slicer
+            // chose while its far end goes to the moved one — and where that
+            // bead is an arc, its `I`/`J` are restated from a start the nozzle
+            // never reached, so the whole sweep turns about a displaced
+            // centre. The line to carry it is the last of the lead to steer,
+            // since a height move after that one leaves the nozzle where it
+            // was left, and it has to name both coordinates to be given a
+            // corner at all. A loop with no such line is left exactly where
+            // the slicer put it: a wall drawn as sliced still prints, and one
+            // approached from the wrong place does not.
+            let Some(travel) = (current.lead..current.body)
+                .rev()
+                .find(|&at| self.buffer[at].steers)
+                .filter(|&at| self.buffer[at].xy.is_some())
+            else {
+                continue;
+            };
             let entry = match current.body {
                 0 => self.entry,
                 body => self.buffer[body - 1].at,
@@ -675,21 +1093,36 @@ impl<'a, W: Write> Pass<'a, W> {
             if span(closes, entry) >= width {
                 continue;
             }
-
-            // Every vertex the loop was drawn through, the closing one
-            // included, so the seam gap survives being offset instead of being
-            // pulled shut. A loop that does close exactly would hand the
-            // offset the same point twice, which names no direction.
-            let mut ring = vec![entry];
-            ring.extend(beads.iter().map(|&at| self.buffer[at].at));
-            let seamed = span(ring[ring.len() - 1], ring[0]) > COINCIDENT;
-            if !seamed {
-                ring.pop();
+            // An arc whose centre could not be read is not a straight move.
+            // Its two ends are where the slicer put them and everything
+            // between them is not, so offsetting the chord would take the bead
+            // off the curve it was drawn on and leave its `R` naming a radius
+            // the new ends do not span.
+            if beads.iter().any(|&at| {
+                let buffered = self.buffer[at];
+                buffered.curved && buffered.arc.is_none()
+            }) {
+                continue;
             }
+
+            // Every vertex the loop was drawn through except the one it closes
+            // on, which is not a corner: it sits partway along the same edge
+            // the loop starts from, a seam gap short of the start. Offered to
+            // the offset as a vertex it becomes the far end of an edge that is
+            // 0.04 mm long, which the miter turns end for end as soon as the
+            // offset is a fraction of that — so the whole loop was declined,
+            // and every wall of every real file with it, above `--extra-flow`
+            // 40 or so.
+            let mut ring = vec![entry];
+            ring.extend(
+                beads[..beads.len() - 1]
+                    .iter()
+                    .map(|&at| self.buffer[at].at),
+            );
             // How the loop travels out of each of those vertices. An arc
             // states its centre relative to where it starts, which is the
             // vertex before it.
-            let mut edges: Vec<Edge> = beads
+            let edges: Vec<Edge> = beads
                 .iter()
                 .enumerate()
                 .map(|(step, &at)| match self.buffer[at].arc {
@@ -700,36 +1133,33 @@ impl<'a, W: Write> Pass<'a, W> {
                     None => Edge::Straight,
                 })
                 .collect();
-            if seamed {
-                edges.push(Edge::Straight);
-            }
 
-            let Some(mut offset) = crate::inset::offset(&ring, &edges, inward) else {
+            let Some(mut offset) = inset::offset(&ring, &edges, inward) else {
                 continue;
             };
-            if seamed {
-                // The closing vertex sits on the same edge as the loop's start
-                // and is offset along its own normal, while the start is a
-                // corner and moves along two. Left alone the gap between them
-                // loses the whole offset, and at a wide enough one the bead
-                // would run past its own seam and double up on it. Carrying the
-                // start's move over keeps the gap the slicer chose, exactly.
-                let last = offset.len() - 1;
-                offset[last] = (
-                    offset[0].0 + (closes.0 - entry.0),
-                    offset[0].1 + (closes.1 - entry.1),
-                );
-                // Which can pull the last bead off the circle it is drawn on,
-                // where that bead is an arc.
-                if !crate::inset::keeps_its_arcs(&offset, &edges) {
-                    continue;
-                }
+            // The loop closes where its own start moved to, less the gap the
+            // slicer left there. Carrying the start's move over keeps that gap
+            // exactly, where offsetting the closing point along its own normal
+            // would lose the whole of it and at a wide enough offset run the
+            // bead past its own seam. The vertex is a translation of one the
+            // offset has already judged, by the same vector as in the file, so
+            // the sweep it gives the closing bead stands in the same relation
+            // to the judged one as the slicer's own did.
+            offset.push((
+                offset[0].0 + (closes.0 - entry.0),
+                offset[0].1 + (closes.1 - entry.1),
+            ));
+            ring.push(closes);
+            // Which can still pull the last bead off the circle it is drawn
+            // on, where that bead is an arc.
+            if !inset::keeps_its_arcs(&offset, &edges) {
+                continue;
             }
 
             for (step, &at) in beads.iter().enumerate() {
-                let next = (step + 1) % offset.len();
-                let was = crate::inset::length(ring[step], ring[next], edges[step]);
-                let now = crate::inset::length(offset[step], offset[next], edges[step]);
+                let next = step + 1;
+                let was = inset::length(ring[step], ring[next], edges[step]);
+                let now = inset::length(offset[step], offset[next], edges[step]);
                 let ratio = if was > 0.0 { now / was } else { 1.0 };
                 // An arc names its centre from wherever it starts, so moving
                 // its start moves the words that point at the centre too.
@@ -745,18 +1175,11 @@ impl<'a, W: Write> Pass<'a, W> {
                     ratio,
                 });
             }
-            // The travel that reached the loop has to land where it now
-            // starts, or its first bead is laid from the old corner.
-            if let Some(travel) = (current.lead..current.body)
-                .rev()
-                .find(|&at| self.buffer[at].positions)
-            {
-                moved[travel] = Some(Moved {
-                    to: offset[0],
-                    centre: None,
-                    ratio: 1.0,
-                });
-            }
+            moved[travel] = Some(Moved {
+                to: offset[0],
+                centre: None,
+                ratio: 1.0,
+            });
         }
         moved
     }
@@ -776,30 +1199,30 @@ impl<'a, W: Write> Pass<'a, W> {
     /// and comments lost the carrier for 2 of 132 raises on a stock
     /// OrcaSlicer file, and for all 132 once an `M73` followed every layer's
     /// `G1 Z`.
-    fn keep(&mut self, raw: &str, line: Line<'_>, from: (f64, f64)) -> io::Result<()> {
+    fn keep(&mut self, line: Line<'_>, from: (f64, f64)) -> io::Result<()> {
         let lays = (line.x.is_some() || line.y.is_some()) && line.e.is_some();
         let holds = self.loops.is_empty() && self.buffer.len() < TAIL && !lays;
         if holds {
             if self.buffer.is_empty() {
                 self.entry = from;
             }
-            self.buffer(raw, line);
+            self.buffer(line, from);
             return Ok(());
         }
 
         // Anything else ends the tail, and it has to be written out before the
         // line that ended it.
         self.flush()?;
-        if let Some(z) = line.z.filter(|_| line.is_move()) {
-            self.nozzle_z = Some(z);
+        if line.z.is_some() && line.is_move() {
+            self.nozzle_z = Some(self.modal.position().2);
         }
         if let Some(rate) = line.f {
             self.feedrate = Some(rate);
         }
-        self.emit(raw, line, 1.0)
+        self.emit(line, 1.0)
     }
 
-    fn buffer(&mut self, raw: &str, line: Line<'_>) {
+    fn buffer(&mut self, line: Line<'_>, from: (f64, f64)) {
         // A `G92` carries an `E` that sets the origin rather than asking for
         // filament, and `set_position` has already dealt with it.
         let delta = line
@@ -807,30 +1230,48 @@ impl<'a, W: Write> Pass<'a, W> {
             .filter(|_| line.draws())
             .map(|e| self.extruder.observe(e));
         let xy = line.xy();
+        // A bead that runs along one axis names one word, and an arc fitted to
+        // a whole circle names neither. Asking for both read such a bead as a
+        // travel, which cut the wall it belonged to in two: the halves were
+        // contoured, numbered and raised apart — a half-layer step in the
+        // middle of one loop — and neither of them closed, so the visible wall
+        // was scaled without ever being moved.
+        //
         // Arc fitting turns a run of short segments into one G2/G3. Leaving
         // those out of a loop would strand its opening arcs in the travel that
         // reaches it, to be printed before the nozzle rises.
-        let extrudes = line.draws() && xy.is_some() && delta.is_some_and(|d| d > 0.0);
-        let positions = line.is_move() && (line.is_xy_move() || line.z.is_some());
-        let carries = positions && line.e.is_none() && line.comment().is_none();
+        let extrudes = line.draws_in_plane() && delta.is_some_and(|d| d > 0.0);
+        let steers = line.is_xy_move();
+        let positions = steers || (line.is_move() && line.z.is_some());
+        let carries = positions && line.e.is_none();
+        let places = line.x.is_some() || line.y.is_some();
 
         let index = self.buffer.len();
         let start = self.arena.len();
-        self.arena.push_str(raw);
+        self.arena.extend_from_slice(line.origin());
         self.buffer.push(Buffered {
             start,
             end: self.arena.len(),
             e_span: line.e_span(),
             e: line.e,
             delta,
-            z: line.z.filter(|_| line.is_move()),
+            // Where the move leaves the nozzle, not the number on the line:
+            // every height this pass compares against is an absolute one.
+            z: line
+                .z
+                .filter(|_| line.is_move())
+                .map(|_| self.modal.position().2),
             f: line.f,
             xy,
+            places,
             at: self.at,
-            arc: line.arc(),
+            arc: line.arc_between(from, self.at),
+            curved: line.code == Code::Arc,
             extrudes,
+            steers,
             positions,
             carries,
+            absolute: self.extruder.is_absolute(),
             resets_origin: line.code == Code::SetPosition,
         });
 
@@ -846,9 +1287,10 @@ impl<'a, W: Write> Pass<'a, W> {
                 if let Some(current) = self.loops.last_mut() {
                     current.external |= feature == Feature::ExternalPerimeter;
                     current.hidden |= feature == Feature::InternalPerimeter;
+                    current.filler &= is_filler(feature);
                 }
             }
-        } else if line.is_xy_move() {
+        } else if steers {
             self.travelled = true;
         }
     }
@@ -865,16 +1307,89 @@ impl<'a, W: Write> Pass<'a, W> {
             lead,
             body,
             end: 0,
+            beads: 0,
             contour: 0,
             external: self.feature == Feature::ExternalPerimeter,
             hidden: self.feature == Feature::InternalPerimeter,
+            filler: is_filler(self.feature),
             raised: false,
             capped: false,
             steps: 0,
+            on_a_raise: false,
+            on_a_climb: false,
             outline: None,
             points: 0,
         });
         self.travelled = false;
+    }
+
+    /// Hands the footprint this layer left standing proud to the next one,
+    /// reusing both buffers rather than allocating a set per layer.
+    fn close_layer(&mut self) {
+        self.rising.settle();
+        self.climbing.settle();
+        std::mem::swap(&mut self.standing, &mut self.rising);
+        std::mem::swap(&mut self.climbed, &mut self.climbing);
+        self.rising.clear();
+        self.climbing.clear();
+        self.floor = None;
+    }
+
+    /// The height this layer's beads sit at, which every raise is measured
+    /// from. The last height commanded stands in until the layer names one,
+    /// since some dialects put a layer's `G1 Z` ahead of its own marker.
+    fn plane(&self) -> f64 {
+        self.floor
+            .or_else(|| self.markerless.plane())
+            .unwrap_or(self.layer_z)
+    }
+
+    /// Writes the buffered region out, but holds back the lines the slicer
+    /// wrote after its last bead.
+    ///
+    /// A file that states no layers only confirms a boundary at the first bead
+    /// laid off the previous plane, by which time the `G1 Z` that reached the
+    /// new plane and the travel that reaches that bead are already buffered
+    /// with the layer that is ending. Writing all of it leaves the next
+    /// layer's first loop nothing to carry its height, so a raised one falls
+    /// back to a `G1 Z` of its own — on the loop's start point, primed, which
+    /// is the seam. Held back, it is the same lead a marked file gives that
+    /// loop through [`Pass::keep`].
+    ///
+    /// The lines are moved rather than re-read: they have already been
+    /// measured against the input stream, and reading them twice would book
+    /// their filament twice.
+    fn flush_before_a_layer(&mut self) -> io::Result<()> {
+        let Some(last) = self.buffer.iter().rposition(|buffered| buffered.extrudes) else {
+            return Ok(());
+        };
+        let split = last + 1;
+        // The same cap [`TAIL`] puts on a held lead, for the same reason.
+        if self.buffer.len() - split > TAIL {
+            return self.flush();
+        }
+        let held: Vec<(Buffered, Vec<u8>)> = self.buffer[split..]
+            .iter()
+            .map(|buffered| {
+                (
+                    *buffered,
+                    self.arena[buffered.start..buffered.end].to_owned(),
+                )
+            })
+            .collect();
+        let entry = self.buffer[last].at;
+        self.buffer.truncate(split);
+        self.holding = !held.is_empty();
+        self.flush()?;
+        self.holding = false;
+        self.entry = entry;
+        for (mut buffered, bytes) in held {
+            buffered.start = self.arena.len();
+            self.arena.extend_from_slice(&bytes);
+            buffered.end = self.arena.len();
+            self.buffer.push(buffered);
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -892,7 +1407,7 @@ impl<'a, W: Write> Pass<'a, W> {
             self.replay(index, 1.0, &moved)?;
         }
 
-        let mut last_raised = false;
+        let mut standing = None;
         for index in 0..self.loops.len() {
             let current = self.loops[index];
             let end = current.end;
@@ -902,13 +1417,10 @@ impl<'a, W: Write> Pass<'a, W> {
             // proud of whatever the slicer prints over it next, into a gap it
             // metered for a whole layer. `extrusion_factor` meters the half
             // gap the column below already filled.
-            let offset = if current.raised {
-                self.offset(current.steps, current.capped)
-            } else {
-                0.0
-            };
+            let offset = self.rise_of(current);
             let raise = offset > 0.0;
-            let target = self.layer_z + offset;
+            let plane = self.plane();
+            let target = plane + offset;
             let carrier = self.carrier(current.lead, current.body, target);
             for at in current.lead..current.body {
                 match carrier {
@@ -919,7 +1431,7 @@ impl<'a, W: Write> Pass<'a, W> {
             // After the lead, so a slicer's own Z-hop restore cannot undo it.
             // A no-op where the carrier already took the nozzle there.
             self.move_z(target, raise)?;
-            let factor = self.extrusion_factor(current.raised, current.steps, current.capped);
+            let factor = self.extrusion_factor(current);
             if raise {
                 let half = self.height() / 2.0;
                 self.raise = Some(match self.raise {
@@ -930,30 +1442,51 @@ impl<'a, W: Write> Pass<'a, W> {
             // A loop metered exactly as sliced has nothing to book, and
             // summing its stock is the one cost here worth avoiding.
             if raise || factor != 1.0 {
-                let geometry = self.geometry(current.raised, current.steps, current.capped);
-                self.meter(current.body, end, factor, geometry, raise);
+                let geometry = self.geometry(current);
+                self.meter(current.body, current.beads, factor, geometry, raise);
             }
             // The nozzle has to come back down before whatever the slicer
             // prints next, and the travel that leaves the region can carry it
-            // just as well as the lead carried the way up.
-            let closing = (index + 1 == self.loops.len() && raise)
-                .then(|| self.carrier(current.body, end, self.layer_z))
+            // just as well as the lead carried the way up — unless the height
+            // that follows is already going somewhere, in which case a reset
+            // would fight it. That is either a `G1 Z` the slicer put in this
+            // region's own tail, or, where the file states no layers, the one
+            // held back for the layer about to open: both take the nozzle to
+            // the next plane themselves.
+            let commanded = self.buffer[current.body..end]
+                .iter()
+                .any(|buffered| buffered.z.is_some());
+            let closing = (index + 1 == self.loops.len() && raise && !commanded && !self.holding)
+                .then(|| self.carrier(current.body, end, plane))
                 .flatten();
             for at in current.body..end {
+                // Past the last bead the flow no longer applies: what is left
+                // is the retraction and wipe that leave the loop, and scaling
+                // those pulls back a length the priming move will not put back.
+                let factor = if at < current.beads { factor } else { 1.0 };
                 match closing {
-                    Some(at_) if at_ == at => self.ride(at, self.layer_z, false, &moved)?,
+                    Some(at_) if at_ == at => self.ride(at, plane, false, &moved)?,
                     _ => self.replay(at, factor, &moved)?,
                 }
             }
 
-            last_raised = raise;
-            self.loops_seen += 1;
+            standing = raise.then_some(target);
+            // Gap fill rides in the buffer to keep the wall around it whole,
+            // but it is not one of the wall's loops and counting it would put
+            // beads in the report that nothing was ever going to raise.
+            self.loops_seen += usize::from(!current.filler);
             self.raised += usize::from(raise);
             self.capped += usize::from(current.raised && current.capped);
         }
 
-        if last_raised {
-            self.move_z(self.layer_z, false)?;
+        // Only where the nozzle is still standing at the raise. A region whose
+        // last lines are the slicer's own retract and lift has already left it,
+        // and writing a height there would pull the nozzle back down through
+        // whatever the lift was for. A region whose tail is being held has not
+        // ended at all: those lines still run before anything else, and they
+        // are what takes the nozzle to the next plane.
+        if !self.holding && standing.is_some_and(|target| self.nozzle_z == Some(target)) {
+            self.move_z(self.plane(), false)?;
         }
 
         self.arena.clear();
@@ -983,9 +1516,18 @@ impl<'a, W: Write> Pass<'a, W> {
                 .loops
                 .get(index + 1)
                 .map_or(self.buffer.len(), |next| next.lead);
-            let (outline, points) = self.measure(self.loops[index].body, end);
+            let body = self.loops[index].body;
+            // The travel out of one loop is pulled into the next one's lead,
+            // so only the region's last loop ever holds a tail of its own —
+            // and that one holds everything to the end of the region.
+            let beads = (body..end)
+                .rev()
+                .find(|&at| self.buffer[at].extrudes)
+                .map_or(body, |at| at + 1);
+            let (outline, points) = self.measure(body, end);
             let current = &mut self.loops[index];
             current.end = end;
+            current.beads = beads;
             current.outline = outline;
             current.points = points;
         }
@@ -1005,10 +1547,22 @@ impl<'a, W: Write> Pass<'a, W> {
         let mut contour = 0;
         let mut opened = 0;
         for index in 0..self.loops.len() {
-            let taken =
-                self.loops[index].external && (opened..index).any(|at| self.loops[at].external);
-            let joins =
-                index > 0 && !taken && (opened..index).rev().any(|at| self.adjacent(at, index));
+            // Gap fill runs between two loops of the wall it belongs to, so it
+            // joins whatever contour is open and neither opens one nor stands
+            // between the loops either side of it. Letting it break the chain
+            // is the same defect as letting its marker flush the region.
+            if self.loops[index].filler {
+                self.loops[index].contour = contour;
+                continue;
+            }
+            let wall = |at: usize| !self.loops[at].filler;
+            let taken = self.loops[index].external
+                && (opened..index).any(|at| wall(at) && self.loops[at].external);
+            let joins = index > 0
+                && !taken
+                && (opened..index)
+                    .rev()
+                    .any(|at| wall(at) && self.adjacent(at, index));
             if !joins {
                 contour += 1;
                 opened = index;
@@ -1055,8 +1609,15 @@ impl<'a, W: Write> Pass<'a, W> {
             while end < self.loops.len() && self.loops[end].contour == contour {
                 end += 1;
             }
-            let loops = end - start;
-            let anchor = (start..end).find(|&at| self.loops[at].external);
+            // Gap fill sits in the contour but is not one of its loops, so the
+            // alternation counts past it: the wall keeps the numbering it
+            // would have had if the slicer had found room for both loops. It
+            // is never the anchor either — a loop that lays a bead of the
+            // visible wall stops being a filler.
+            let walls = (start..end).filter(|&at| !self.loops[at].filler).count();
+            let anchor_at = (start..end).find(|&at| self.loops[at].external);
+            let anchor =
+                anchor_at.map(|at| (start..at).filter(|&at| !self.loops[at].filler).count());
             // Where the visible wall was printed at one end of the region, the
             // slicer worked through the stack in order and a loop's place in
             // it is its distance along the buffer. `inner-outer-inner` breaks
@@ -1064,13 +1625,17 @@ impl<'a, W: Write> Pass<'a, W> {
             // one, which lands it a step from the anchor when it is a whole
             // stack away. Measuring the geometry is the only way to tell, and
             // it is only paid for where the order is not already monotonic.
-            let ranked = anchor.filter(|&at| at != start && at + 1 != end).map(|at| {
-                let mut gaps: Vec<(usize, f64)> = (start..end)
-                    .map(|loop_| (loop_, self.gap(loop_, at)))
-                    .collect();
-                gaps.sort_by(|a, b| a.1.total_cmp(&b.1));
-                gaps
-            });
+            let ranked = anchor
+                .filter(|&place| place != 0 && place + 1 != walls)
+                .and(anchor_at)
+                .map(|at| {
+                    let mut gaps: Vec<(usize, f64)> = (start..end)
+                        .filter(|&loop_| !self.loops[loop_].filler)
+                        .map(|loop_| (loop_, self.gap(loop_, at)))
+                        .collect();
+                    gaps.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    gaps
+                });
 
             if let Some(gaps) = ranked {
                 for (rank, (at, _)) in gaps.into_iter().enumerate() {
@@ -1080,13 +1645,18 @@ impl<'a, W: Write> Pass<'a, W> {
                 start = end;
                 continue;
             }
-            for offset in 0..loops {
+            let mut place: usize = 0;
+            for at in start..end {
+                if self.loops[at].filler {
+                    continue;
+                }
                 let phase = match anchor {
-                    Some(at) => (start + offset).abs_diff(at),
-                    None if self.config.external_perimeters_first => offset + 1,
-                    None => loops - offset,
+                    Some(rank) => place.abs_diff(rank),
+                    None if self.config.external_perimeters_first => place + 1,
+                    None => walls - place,
                 };
-                self.loops[start + offset].raised = !phase.is_multiple_of(2);
+                self.loops[at].raised = !phase.is_multiple_of(2);
+                place += 1;
             }
             self.hold_overhangs(start, end);
             start = end;
@@ -1109,8 +1679,8 @@ impl<'a, W: Write> Pass<'a, W> {
         }
     }
 
-    /// True when any part of the two loops runs within [`MAX_LOOP_GAP`] of the
-    /// other.
+    /// True when the two loops run beside each other, within
+    /// [`MAX_LOOP_GAP`], over [`BESIDE_SHARE`] of one of their paths.
     fn adjacent(&self, previous: usize, current: usize) -> bool {
         let (previous, current) = (self.loops[previous], self.loops[current]);
         // Cheap rejection first: most pairs are a travel apart, and comparing
@@ -1126,24 +1696,62 @@ impl<'a, W: Write> Pass<'a, W> {
             return false;
         }
 
+        // Beside each other along most of one of them, not merely touching
+        // somewhere. Measured both ways round because a wall that widens
+        // leaves the shorter loop beside the longer along the whole of
+        // itself while the longer runs on past its end.
+        self.beside(current, previous) || self.beside(previous, current)
+    }
+
+    /// True where more than [`BESIDE_SHARE`] of `current`'s probed path runs
+    /// within [`MAX_LOOP_GAP`] of `other`'s.
+    fn beside(&self, current: Loop, other: Loop) -> bool {
+        if current.points == 0 {
+            return false;
+        }
         let stride = current.points.div_ceil(PROBES).max(1);
+        let probes = current.points.div_ceil(stride);
         let limit = MAX_LOOP_GAP * MAX_LOOP_GAP;
-        self.points(current.body, current.end)
-            .step_by(stride)
-            .any(|(x, y)| {
-                self.points(previous.body, previous.end).any(|(px, py)| {
-                    let (dx, dy) = (px - x, py - y);
-                    dx * dx + dy * dy <= limit
-                })
-            })
+        let enough = probes as f64 * BESIDE_SHARE;
+        let (mut near, mut apart) = (0usize, 0usize);
+        for (x, y) in self.points(current.body, current.end).step_by(stride) {
+            let close = self.points(other.body, other.end).any(|(px, py)| {
+                let (dx, dy) = (px - x, py - y);
+                dx * dx + dy * dy <= limit
+            });
+            near += usize::from(close);
+            apart += usize::from(!close);
+            // Settled either way: neither the probes left nor the ones
+            // already counted can change the answer.
+            if near as f64 > enough {
+                return true;
+            }
+            if (probes - apart) as f64 <= enough {
+                return false;
+            }
+        }
+        near as f64 > enough
     }
 
     /// The points a loop lays down, in print order.
+    ///
+    /// An arc is followed round its own curve rather than cut across. A
+    /// `G2`/`G3` states only where it ends, so a loop read off its endpoints
+    /// is read off its chords, and where a slicer cut two concentric loops at
+    /// different angles their chords part company by far more than the bead
+    /// between them — see [`ARC_STEP`].
     fn points(&self, from: usize, to: usize) -> impl Iterator<Item = (f64, f64)> + '_ {
-        self.buffer[from..to]
-            .iter()
-            .filter(|buffered| buffered.extrudes)
-            .filter_map(|buffered| buffered.xy)
+        let mut at = match from {
+            0 => self.entry,
+            index => self.buffer[index - 1].at,
+        };
+        self.buffer[from..to].iter().flat_map(move |buffered| {
+            let previous = std::mem::replace(&mut at, buffered.at);
+            match buffered.extrudes {
+                true => Along::new(previous, buffered.at, buffered.arc),
+                false => Along::nowhere(),
+            }
+        })
     }
 
     /// The closest the two loops' paths come to each other, squared.
@@ -1196,17 +1804,18 @@ impl<'a, W: Write> Pass<'a, W> {
     ///
     /// The last move of the range is the one to use, since anything after it
     /// would override the height. It has to be a plain move: an extrusion or a
-    /// wipe follows the layer below and cannot be tilted, and a line that
-    /// already carries a comment has no room for the stamp that stops the file
-    /// being processed twice.
+    /// wipe follows the layer below and cannot be tilted.
     fn carrier(&self, from: usize, to: usize, z: f64) -> Option<usize> {
-        // Nothing to carry where the lead already leaves the nozzle there.
-        let landing = self.buffer[from..to]
+        // Where this range leaves the nozzle, if it commands a height at all.
+        // Only this range: the nozzle also stands off the plane wherever the
+        // loop before it was raised, and that is this pass's own doing rather
+        // than a lift of the slicer's to be preserved.
+        let commanded = self.buffer[from..to]
             .iter()
             .rev()
-            .find_map(|buffered| buffered.z)
-            .or(self.nozzle_z);
-        if landing == Some(z) {
+            .find_map(|buffered| buffered.z);
+        // Nothing to carry where the range already leaves the nozzle there.
+        if commanded.or(self.nozzle_z) == Some(z) {
             return None;
         }
         let index = to
@@ -1216,10 +1825,13 @@ impl<'a, W: Write> Pass<'a, W> {
                 .position(|b| b.positions)?
             - 1;
         let carrier = self.buffer[index];
-        // Never ride a move the slicer put above the plane on purpose:
-        // pulling a Z-hop down to printing height would drag the nozzle
-        // through what it was lifted to clear.
-        (carrier.carries && carrier.z.is_none_or(|had| had <= z)).then_some(index)
+        // Never ride a move that runs under a lift the slicer made on purpose:
+        // pulling a Z-hop down to printing height drags the nozzle through
+        // what it was lifted to clear. The lift is usually a line of its own,
+        // and the travel after it names no `Z` and inherits the height — so
+        // testing the candidate's own word finds nothing, accepts the travel
+        // and undoes the whole hop.
+        (carrier.carries && commanded.is_none_or(|had| had <= z)).then_some(index)
     }
 
     /// Replays a buffered move with its height set to `z`, in place of the
@@ -1227,6 +1839,12 @@ impl<'a, W: Write> Pass<'a, W> {
     /// also being taken sideways carries both at once: dropping the height
     /// onto a line of its own instead would put a toolhead stop back on the
     /// seam of every loop the visible wall is drawn in on.
+    ///
+    /// The stamp goes in front of whatever the line already said, because that
+    /// is where the survey and every other reader look for it: a comment is
+    /// everything past the first `;`, so a stamp appended behind the slicer's
+    /// own note is no longer the start of one. Nothing of the note is lost —
+    /// it follows the stamp on the same line.
     fn ride(
         &mut self,
         index: usize,
@@ -1242,8 +1860,20 @@ impl<'a, W: Write> Pass<'a, W> {
         let note = if raised { "raised" } else { "reset" };
         let to = moved[index];
         let Self { arena, out, .. } = self;
+        let raw = &arena[buffered.start..buffered.end];
+        let (body, said) = match raw.iter().position(|byte| *byte == b';') {
+            Some(at) => {
+                let kept = raw[..at]
+                    .iter()
+                    .rposition(|byte| !byte.is_ascii_whitespace())
+                    .map_or(0, |end| end + 1);
+                (&raw[..kept], Some(&raw[at + 1..]))
+            }
+            None => (raw, None),
+        };
         // No `E` word to rescale: `Buffered::carries` is only true without one.
-        let line = Line::parse(&arena[buffered.start..buffered.end]);
+        let text = repaired(body);
+        let line = Line::parse_bytes(&text, body);
         let written = match to {
             Some(moved) => line.write_moved(out, moved.to, moved.centre, None, Some(z))?,
             None => false,
@@ -1251,7 +1881,12 @@ impl<'a, W: Write> Pass<'a, W> {
         if !written {
             line.write_z(out, z)?;
         }
-        writeln!(out, " ; {BRICK_STAMP}{note}")
+        write!(out, " ; {BRICK_STAMP}{note}")?;
+        if let Some(said) = said {
+            out.write_all(b" ;")?;
+            out.write_all(said)?;
+        }
+        out.write_all(b"\n")
     }
 
     /// Replays a buffered line, its flow scaled by `factor` and, where the
@@ -1260,7 +1895,12 @@ impl<'a, W: Write> Pass<'a, W> {
     /// flow per mm is what the slicer metered times the factor.
     fn replay(&mut self, index: usize, factor: f64, moved: &[Option<Moved>]) -> io::Result<()> {
         let buffered = self.buffer[index];
-        let to = moved[index];
+        // The length a bead is metered against is the one it is written at, so
+        // the move and the ratio it changed the path by are decided together:
+        // taking the ratio off a write that then does not happen meters a bead
+        // for a path nothing drew. A line naming neither coordinate is the one
+        // case `Line::write_moved` refuses.
+        let to = moved[index].filter(|_| buffered.places);
         if let Some(z) = buffered.z {
             self.nozzle_z = Some(z);
         }
@@ -1274,6 +1914,12 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(delta) = buffered.delta.filter(|delta| *delta > 0.0) {
             self.filament += delta * factor;
         }
+        // The convention this line's own words were read in, which a `M82` or
+        // `M83` still buffered behind it has not changed yet. The extruder's
+        // mode belongs to the input while a region is held, so it is put back
+        // the moment the value is settled.
+        let reading = self.extruder.is_absolute();
+        self.extruder.set_mode(e_mode(buffered.absolute));
 
         let Self {
             arena,
@@ -1283,9 +1929,11 @@ impl<'a, W: Write> Pass<'a, W> {
         } = self;
         let raw = &arena[buffered.start..buffered.end];
         let value = buffered.delta.map(|delta| extruder.advance(delta * factor));
+        extruder.set_mode(e_mode(reading));
 
         if let Some(moved) = to {
-            let line = Line::parse(raw);
+            let text = repaired(raw);
+            let line = Line::parse_bytes(&text, raw);
             if line.write_moved(out, moved.to, moved.centre, value, None)? {
                 return out.write_all(b"\n");
             }
@@ -1305,14 +1953,14 @@ impl<'a, W: Write> Pass<'a, W> {
         out.write_all(b"\n")
     }
 
-    fn emit(&mut self, raw: &str, line: Line<'_>, factor: f64) -> io::Result<()> {
+    fn emit(&mut self, line: Line<'_>, factor: f64) -> io::Result<()> {
         if line.code == Code::SetPosition {
             if let Some(value) = line.e {
                 self.extruder.advance_origin(value);
             }
         }
         let Some(e) = line.e.filter(|_| line.draws()) else {
-            return self.push(raw);
+            return self.push(line.origin());
         };
         let delta = self.extruder.observe(e);
         if delta > 0.0 {
@@ -1320,43 +1968,108 @@ impl<'a, W: Write> Pass<'a, W> {
         }
         let value = self.extruder.advance(delta * factor);
         if value == e {
-            return self.push(raw);
+            return self.push(line.origin());
         }
         line.write_e(&mut self.out, value)?;
         self.out.write_all(b"\n")
     }
 
-    /// Flow a loop's bead needs, as a multiple of what the slicer metered it
-    /// for.
-    fn extrusion_factor(&self, raised: bool, steps: usize, capped: bool) -> f64 {
-        self.geometry(raised, steps, capped) * self.multiplier()
+    /// Copies one piece of a line too long to be held whole straight out,
+    /// exactly as it arrived and with no terminator behind it.
+    ///
+    /// [`Lines`] hands such a line over in pieces, and those pieces are one
+    /// line of the file — a comment carrying an embedded object name, or a
+    /// thumbnail. A newline written between two of them would make the tail of
+    /// that line a command in its own right, and the tail of a thumbnail is
+    /// whatever base64 happened to spell. So nothing is written between them
+    /// and the newline is owed until the whole line has gone by; see
+    /// [`Pass::rejoin`].
+    ///
+    /// Whatever this pass is holding goes out first. The piece is copied *past*
+    /// the transform rather than through it, so it must not overtake beads the
+    /// slicer wrote before it.
+    fn spill(&mut self, piece: &[u8]) -> io::Result<()> {
+        self.flush()?;
+        self.out.write_all(piece)?;
+        self.spilling = true;
+        Ok(())
     }
 
-    /// What the bead's own shape asks for, before the multiplier. A loop left
-    /// on the plane spans its layer and is metered as sliced.
-    fn geometry(&self, raised: bool, steps: usize, capped: bool) -> f64 {
-        if raised {
-            self.span(steps, capped)
-        } else {
-            1.0
+    /// Ends a line that was handed over in pieces, now that the last of them
+    /// has been written. Nothing at all where no line was.
+    fn rejoin(&mut self) -> io::Result<()> {
+        match std::mem::take(&mut self.spilling) {
+            true => self.out.write_all(b"\n"),
+            false => Ok(()),
         }
     }
 
-    /// How far a raised bead reaches, as a multiple of its own layer's height.
+    /// Flow a loop's bead needs, as a multiple of what the slicer metered it
+    /// for.
     ///
-    /// It starts on top of whatever its column left on the layer below and
-    /// ends at the nozzle, so the span is this layer's height plus the ground
-    /// its offset gained over the one beneath it. Where the two offsets match
-    /// it spans exactly one layer and the arithmetic is skipped rather than
-    /// trusted: `(h + x) - x` is not `h` in binary.
-    fn span(&self, steps: usize, capped: bool) -> f64 {
-        let offset = self.offset(steps, capped);
-        let below = self.rise_below(steps);
+    /// A filler is buffered with the wall it belongs to but is not one of its
+    /// loops, so it is never raised and never given the wall's flow — the
+    /// multiplier is the whole of what "the wall's flow" means here, and no
+    /// filler ever takes it. What is left is the gap the bead crosses, and
+    /// that is measured for a filler exactly as it is for every other bead:
+    /// the plane it starts from is whatever the layer below actually left
+    /// under it, so a bead laid over a column standing half a layer proud has
+    /// half the gap to fill and is metered for half.
+    ///
+    /// Both kinds of filler take it. A thin wall is plainly a bead of its own
+    /// with a plane under it. Gap fill is laid into the valley between two
+    /// beads and straddles whatever they did, so the plane under it is a
+    /// coarser answer — but it is still a measured one, and the alternative is
+    /// not "as sliced" but "metered for a whole layer over half a gap", which
+    /// pours twice what the gap holds. That is also what lets gap fill count
+    /// as covering the raise beneath it; see
+    /// [`covers_a_raise`](crate::scan). The two go together: a region that
+    /// stops a column being capped has to be metered against the column it
+    /// stopped.
+    fn extrusion_factor(&self, current: Loop) -> f64 {
+        if current.filler {
+            return self.geometry(current);
+        }
+        self.geometry(current) * self.multiplier()
+    }
+
+    /// How far the bead reaches, as a multiple of its own layer's height,
+    /// before the multiplier.
+    ///
+    /// It starts on top of whatever the layer below left under it and ends at
+    /// the nozzle, so the span is this layer's height plus the ground its own
+    /// rise gains over that. Where the two match it spans exactly one layer
+    /// and the arithmetic is skipped rather than trusted: `(h + x) - x` is not
+    /// `h` in binary.
+    ///
+    /// Both ends are read off what actually happened rather than off the
+    /// parity, because the two part company: a wall that gains or loses a loop
+    /// renumbers, and a stretch the slicer calls an overhang is held flat
+    /// whatever its column did. A bead metered for a parity it no longer has
+    /// crosses **half** the gap it was fed for, which is the one direction
+    /// that blobs.
+    fn geometry(&self, current: Loop) -> f64 {
+        let offset = self.rise_of(current);
+        let below = self.rise_below(current);
         if offset == below {
             return 1.0;
         }
         let height = self.height();
-        (height + offset - below) / height
+        // Floored at nothing rather than allowed to go negative. The ground
+        // can stand above the nozzle where a layer is under half the one
+        // beneath it, and a negative factor is not a thin bead but a
+        // retraction written mid-wall, which unprimes the nozzle and leaves
+        // the extruder measuring from a position it never reached.
+        ((height + offset - below) / height).max(0.0)
+    }
+
+    /// How far above its layer's plane this loop is printed.
+    fn rise_of(&self, current: Loop) -> f64 {
+        if current.raised {
+            self.offset(current.steps, current.capped)
+        } else {
+            0.0
+        }
     }
 
     /// The flow the walls of this layer take, except on the layer laid on the
@@ -1427,13 +2140,28 @@ impl<'a, W: Write> Pass<'a, W> {
         }
     }
 
-    /// The offset the same column was left standing at on the layer below,
-    /// measured from that layer's height rather than this one's.
-    fn rise_below(&self, steps: usize) -> f64 {
-        match steps {
-            0 => 0.0,
-            steps => self.rise_at(steps - 1, self.layer - 1),
-        }
+    /// The offset the material under this loop was left standing at, measured
+    /// from the layer below's height rather than this one's.
+    ///
+    /// Zero wherever that layer left nothing proud here, however this loop's
+    /// own parity fell. Where it did leave something, how tall it stood is
+    /// read off the footprint too: a column reaches its offset over [`RAMP`]
+    /// layers, so what is under a bead is either the full rise or the one
+    /// intermediate step of the climb.
+    ///
+    /// It used to be worked out from this loop's own `steps`, which is three
+    /// valued — nought, one, or the object's whole age. A column opening at
+    /// layer M is supported from M+2 on, so from there its loops read as old
+    /// as the object and the layer below was taken for a settled raise when it
+    /// was really the middle of the climb: the span came out 1.0 where the
+    /// truth is 1.25, feeding the bead four fifths of the gap it crosses. That
+    /// is the roof of every bridged hole and the underside of every shelf, two
+    /// layers above the column's first bead.
+    fn rise_below(&self, current: Loop) -> f64 {
+        let Some(below) = self.layer.checked_sub(1).filter(|_| current.on_a_raise) else {
+            return 0.0;
+        };
+        self.rise_at(if current.on_a_climb { 1 } else { RAMP }, below)
     }
 
     /// Layers printed since this object's first. A file that completes objects
@@ -1464,7 +2192,12 @@ impl<'a, W: Write> Pass<'a, W> {
     /// path is laid where nothing stands beneath it.
     ///
     /// Both answers come from the same walk of the loop's path, since the walk
-    /// is what costs: three sets are tested for the price of one.
+    /// is what costs: five sets are tested for the price of one. The last two
+    /// are what the layer below left standing proud and how much of that was a
+    /// column still climbing, which is what tells a bead laid on a raise from
+    /// one laid on the plane and a full raise from half of one — none of the
+    /// three can be read off this loop's own parity or age, and a bead metered
+    /// for the wrong one crosses less of the gap it was fed for.
     fn mark_columns(&mut self) {
         // The object's last wall layer is capped whether or not the file gave
         // the survey the geometry to work the rest out for itself.
@@ -1479,9 +2212,40 @@ impl<'a, W: Write> Pass<'a, W> {
             .layer
             .checked_sub(1)
             .and_then(|layer| cells(self.unsupported, layer));
+        // Both are held by this pass rather than the survey, so they are taken
+        // out for the walk and handed straight back.
+        let standing = self.standing.take();
+        let climbed = self.climbed.take();
+        let mut rising = self.rising.take();
+        let mut climbing = self.climbing.take();
+        let mut path = std::mem::take(&mut self.path);
+        let proud = (!standing.is_empty()).then_some(&standing);
+        let part_way = (!climbed.is_empty()).then_some(&climbed);
 
         for index in 0..self.loops.len() {
-            let (share, points) = self.shares([above, here, below], self.loops[index]);
+            let (share, points, traced) = self.shares(
+                [above, here, below, proud, part_way],
+                self.loops[index],
+                &mut path,
+            );
+            // A walk that could not be completed says nothing about what is
+            // over this loop or under it, and every one of the answers below
+            // is a share of a path whose length is now unknown. The loop is
+            // left on its layer's plane instead: a wall printed as the slicer
+            // sliced it is a wall that prints, where a raise measured against
+            // a part of a loop is a bead metered for a gap it does not cross.
+            // Nothing of it is absorbed into `rising` either, so the layer
+            // above measures nothing standing here — which is exactly what
+            // will have been printed.
+            if traced == Trace::Refused {
+                self.warn_about_the_trace();
+                self.loops[index].raised = false;
+                self.loops[index].capped = false;
+                self.loops[index].steps = object;
+                self.loops[index].on_a_raise = false;
+                self.loops[index].on_a_climb = false;
+                continue;
+            }
             let over = |set: usize| points > 0 && share[set] as f64 > points as f64 * CAP_SHARE;
             self.loops[index].capped = tops || over(0);
             self.loops[index].steps = match (over(1), over(2)) {
@@ -1489,16 +2253,50 @@ impl<'a, W: Write> Pass<'a, W> {
                 (_, true) => 1,
                 _ => object,
             };
+            self.loops[index].on_a_raise =
+                points > 0 && share[3] as f64 > points as f64 * SEAM_SHARE;
+            // What is climbing is a subset of what is standing, so the raise
+            // below is a climbing one where most of what stands under this
+            // loop is. A mix takes the settled height, which is the taller of
+            // the two: reading a bead as crossing less than it does leaves it
+            // a little short, and reading it as crossing more pours what the
+            // gap cannot hold.
+            self.loops[index].on_a_climb = share[4] * 2 > share[3];
+            let current = self.loops[index];
+            if self.rise_of(current) > 0.0 {
+                rising.absorb(&path);
+                // The intermediate step of the ramp, which the layer above
+                // has to meter against rather than against the full offset.
+                if current.steps < RAMP {
+                    climbing.absorb(&path);
+                }
+            }
         }
+        self.standing = standing;
+        self.climbed = climbed;
+        self.rising = rising;
+        self.climbing = climbing;
+        self.path = path;
     }
 
-    /// How much of a loop's path falls in each of the given sets, and how much
-    /// path there was.
-    fn shares(&self, sets: [Option<&Cells>; 3], current: Loop) -> ([usize; 3], usize) {
-        let mut found = [0usize; 3];
-        let mut walked = 0usize;
-        // A loop starts where the one before it finished, and the first loop
-        // of a region starts where the nozzle stood when the region opened.
+    /// Says once that a loop's path could not be walked. The user's print is
+    /// already running, so this is never a failure: the loops it touches are
+    /// left exactly as the slicer wrote them and the rest of the file is
+    /// bricked as usual.
+    fn warn_about_the_trace(&mut self) {
+        if std::mem::replace(&mut self.warned, true) {
+            return;
+        }
+        eprintln!(
+            "corbel: warning: a wall move could not be followed, so the loops holding it are left on their layer's plane"
+        );
+    }
+
+    /// Walks the moves that lay a loop's beads, as `(from, to, arc)`.
+    ///
+    /// A loop starts where the one before it finished, and the first loop of a
+    /// region starts where the nozzle stood when the region opened.
+    fn trace(&self, current: Loop, mut visit: impl FnMut((f64, f64), (f64, f64), Option<Arc>)) {
         let mut from = match current.lead {
             0 => self.entry,
             lead => self.buffer[lead - 1].at,
@@ -1506,16 +2304,39 @@ impl<'a, W: Write> Pass<'a, W> {
         for index in current.lead..current.end {
             let buffered = self.buffer[index];
             if buffered.extrudes {
-                footprint::cells(from, buffered.at, buffered.arc, |cell| {
-                    walked += 1;
-                    for (at, set) in sets.iter().enumerate() {
-                        found[at] += usize::from(set.is_some_and(|cells| cells.has(cell)));
-                    }
-                });
+                visit(from, buffered.at, buffered.arc);
             }
             from = buffered.at;
         }
-        (found, walked)
+    }
+
+    /// How much of a loop's path falls in each of the given sets, how much
+    /// path there was, and the cells it went through, left in `path`.
+    ///
+    /// [`Trace::Refused`] where the walk could not be completed — a move no
+    /// printer makes, which no answer can be read off. The counts that come
+    /// back with it describe part of the loop and are not a share of it.
+    fn shares(
+        &self,
+        sets: [Option<&Cells>; 5],
+        current: Loop,
+        path: &mut Vec<u32>,
+    ) -> ([usize; 5], usize, Trace) {
+        let mut found = [0usize; 5];
+        let mut traced = Trace::Whole;
+        path.clear();
+        self.trace(current, |from, to, arc| {
+            let walk = footprint::cells(footprint::Grid::default(), from, to, arc, |cell| {
+                path.push(cell);
+                for (at, set) in sets.iter().enumerate() {
+                    found[at] += usize::from(set.is_some_and(|cells| cells.has(cell)));
+                }
+            });
+            if walk == Trace::Refused {
+                traced = Trace::Refused;
+            }
+        });
+        (found, path.len(), traced)
     }
 
     /// Books what a loop's flow costs: the stock a raised loop lays, and the
@@ -1564,2166 +2385,24 @@ impl<'a, W: Write> Pass<'a, W> {
         }
     }
 
-    fn push(&mut self, line: &str) -> io::Result<()> {
+    fn push(&mut self, line: &[u8]) -> io::Result<()> {
         write_line(&mut self.out, line)
     }
 }
 
-fn write_line<W: Write>(out: &mut W, line: &str) -> io::Result<()> {
-    out.write_all(line.as_bytes())?;
+fn write_line<W: Write>(out: &mut W, line: &[u8]) -> io::Result<()> {
+    out.write_all(line)?;
     out.write_all(b"\n")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn layer(z: f64) -> String {
-        format!(";LAYER_CHANGE\nG1 Z{z:.2} F600\n")
-    }
-
-    fn relative(body: &str) -> String {
-        format!("; layer_height = 0.2\nM83\n{body}")
-    }
-
-    /// A file whose middle layer carries `body`, so neither the layers a
-    /// column climbs over nor the one that caps it applies.
-    ///
-    /// The same wall runs the whole height of the file, as it does in a real
-    /// one. Without a copy above, the body would be the last layer holding a
-    /// wall, which caps it; without copies below, it would be a column that
-    /// begins out of nowhere, which starts the climb instead. Either way the
-    /// body measures something other than the steady state. The copies are
-    /// stripped of their tags so they stay out of [`loop_states`], which does
-    /// mean a body's loops are counted five times in `Stats::loops`.
-    fn middle_layer(body: &str) -> String {
-        let same = untagged(body);
-        relative(&format!(
-            "{}{same}{}{same}{}{same}{}{body}{}{same}",
-            layer(0.2),
-            layer(0.4),
-            layer(0.6),
-            layer(0.8),
-            layer(1.0),
-        ))
-    }
-
-    /// `body` with its trailing comments removed, so the same geometry can be
-    /// emitted twice without the tags being counted twice. Marker lines, which
-    /// are nothing but a comment, are kept whole.
-    fn untagged(body: &str) -> String {
-        let mut text = String::new();
-        for line in body.lines() {
-            let kept = match line.trim_start().starts_with(';') {
-                true => line,
-                false => line.split(';').next().unwrap_or(line).trim_end(),
-            };
-            text.push_str(kept);
-            text.push('\n');
-        }
-        text
-    }
-
-    /// One wall's internal perimeter loops, the way a slicer emits them:
-    /// concentric squares printed innermost first, since every mainstream
-    /// slicer lays the external perimeter down last. Each loop is an extrusion
-    /// width out from the one before and reached by its own travel, and each
-    /// one's first extrusion is labelled `<tag><number>` in print order, so
-    /// the highest number is the loop against the visible wall.
-    fn wall(loops: usize, tag: &str) -> String {
-        wall_of(loops, tag, 0.0, 10.0, 0.5)
-    }
-
-    fn wall_of(loops: usize, tag: &str, origin: f64, size: f64, flow: f64) -> String {
-        let mut text = String::new();
-        for index in 0..loops {
-            let step = 0.45 * (loops - 1 - index) as f64;
-            let near = origin + step;
-            let far = origin + size - step;
-            text.push_str(&format!("G1 X{near:.2} Y{near:.2} F9000\n"));
-            text.push_str(&format!(
-                "G1 X{far:.2} Y{near:.2} E{flow} ; {tag}{}\n",
-                index + 1
-            ));
-            for (x, y) in [(far, far), (near, far), (near, near)] {
-                text.push_str(&format!("G1 X{x:.2} Y{y:.2} E{flow}\n"));
-            }
-        }
-        text
-    }
-
-    fn run(source: &str, config: &Config) -> String {
-        apply(source, config).gcode
-    }
-
-    /// The shipped settings with the flow left alone, for a test that measures
-    /// what the geometry asks for rather than what the multiplier adds to it.
-    fn plain() -> Config {
-        Config {
-            wall_flow: Some(1.0),
-            ..Config::default()
-        }
-    }
-
-    /// A file that states the width its visible wall was metered at, which is
-    /// what turns a multiplier into a distance to draw that wall in by.
-    ///
-    /// 0.4 mm at a multiplier of 1.3 gives an offset of exactly 0.06, so the
-    /// moved coordinates are readable rather than rounded.
-    fn with_skin_width(body: &str) -> String {
-        format!("; external_perimeter_extrusion_width = 0.4\n{body}")
-    }
-
-    fn drawn_in() -> Config {
-        Config {
-            wall_flow: Some(1.3),
-            ..Config::default()
-        }
-    }
-
-    /// A 10 mm square of visible wall, printed anticlockwise as a slicer emits
-    /// an island's boundary.
-    fn skin() -> String {
-        format!(
-            ";TYPE:External perimeter\n{}",
-            wall_of(1, "skin", 0.0, 10.0, 1.0)
-        )
-    }
-
-    /// The same square, stopped `gap` mm short of its own seam, which is what
-    /// a slicer actually emits so the two ends of a ring do not pile up.
-    fn seamed_skin(gap: f64) -> String {
-        format!(
-            ";TYPE:External perimeter\n\
-             G1 X0.00 Y0.00 F9000\n\
-             G1 X10.00 Y0.00 E1 ; skin1\n\
-             G1 X10.00 Y10.00 E1\n\
-             G1 X0.00 Y10.00 E1\n\
-             G1 X0.00 Y{gap:.3} E1\n"
-        )
-    }
-
-    /// Each tagged loop in the output, paired with whether the nozzle was
-    /// raised when it printed.
-    fn loop_states(out: &str) -> Vec<(String, bool)> {
-        let mut raised = false;
-        let mut states = Vec::new();
-        for line in out.lines() {
-            let Some((body, tag)) = line.rsplit_once("; ") else {
-                continue;
-            };
-            if let Some(note) = tag.strip_prefix(BRICK_STAMP) {
-                match note {
-                    "raised" => raised = true,
-                    "reset" => raised = false,
-                    _ => {}
-                }
-            } else if !body.trim().is_empty() {
-                states.push((tag.to_owned(), raised));
-            }
-        }
-        states
-    }
-
-    #[test]
-    fn raises_every_other_internal_loop() {
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
-        let out = run(&source, &Config::default());
-        assert!(
-            out.contains("G1 X0.00 Y0.00 F9000 Z0.900 ; bricklayers brick raised"),
-            "{out}"
-        );
-        assert!(
-            out.contains("G1 Z0.800 F600 ; bricklayers brick reset"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn a_height_change_rides_the_travel_that_reaches_the_loop() {
-        // A `G1 Z` of its own names no other axis, so the planner stops the
-        // toolhead to run it and the nozzle sits primed over the loop's start
-        // point while the axis crawls. Every loop starts at the seam, so an
-        // aligned seam stacks the ooze from all of them into one line.
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(3, "loop")));
-        let out = run(&source, &Config::default());
-        let halts = |note: &str| {
-            out.lines()
-                .filter(|line| line.starts_with("G1 Z") && line.ends_with(note))
-                .count()
-        };
-        let ridden = out
-            .lines()
-            .filter(|line| line.contains(" X") && line.contains(BRICK_STAMP))
-            .count();
-        assert!(ridden > 0, "no height change rode a travel:\n{out}");
-        assert_eq!(
-            halts("raised"),
-            0,
-            "every raise has the travel that reaches its loop to ride:\n{out}"
-        );
-        // Riding a travel must not move the bead: every loop is still laid at
-        // the height it was laid at before.
-        assert!(
-            out.contains("G1 X0.00 Y0.00 F9000 Z0.900 ; bricklayers brick raised"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("G1 Z0.900"),
-            "the raise still stopped the toolhead:\n{out}"
-        );
-    }
-
-    #[test]
-    fn a_height_change_never_rides_a_z_hop_down() {
-        // Pulling a hop down to printing height would drag the nozzle through
-        // exactly what the slicer lifted it to clear. The restore rides the
-        // first extrusion here, so the hop is the last move of the lead and is
-        // the one a careless rewrite would land on.
-        let source = middle_layer(
-            ";TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E0.5\n\
-             G1 X9.55 Y9.55 E0.5\n\
-             G1 X0.45 Y9.55 E0.5\n\
-             G1 X0.45 Y0.45 E0.5\n\
-             G1 X0 Y0 Z1.4 F9000\n\
-             G1 X10 Y0 Z0.8 E0.5\n\
-             G1 X10 Y10 E0.5\n\
-             G1 X0 Y10 E0.5\n\
-             G1 X0 Y0 E0.5\n",
-        );
-        let out = run(&source, &Config::default());
-        assert!(
-            out.contains("G1 X0 Y0 Z1.4 F9000\n"),
-            "the hop was flattened onto the layer:\n{out}"
-        );
-    }
-
-    #[test]
-    fn inserted_z_moves_carry_a_feedrate_and_hand_the_print_speed_back() {
-        // A bare `G1 Z` inherits whatever `F` came last, which after a travel
-        // slews the Z axis at travel speed. `F` is modal, so the print speed
-        // has to be restored before the loop resumes. The travel here already
-        // carries a comment, which is where the stamp would have to go, so the
-        // height cannot ride it and the fallback is what runs.
-        let source = middle_layer(
-            ";TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E0.5\n\
-             G1 X9.55 Y9.55 E0.5\n\
-             G1 X0.45 Y9.55 E0.5\n\
-             G1 X0.45 Y0.45 E0.5\n\
-             G1 X0 Y0 F9000 ; travel\n\
-             G1 F1800\n\
-             G1 X10 Y0 E0.5\n\
-             G1 X10 Y10 E0.5\n\
-             G1 X0 Y10 E0.5\n\
-             G1 X0 Y0 E0.5\n",
-        );
-        let out = run(&source, &Config::default());
-        assert!(
-            out.contains("G1 Z0.900 F600 ; bricklayers brick raised"),
-            "{out}"
-        );
-        assert!(out.contains("G1 F1800 ; bricklayers brick resume"), "{out}");
-    }
-
-    #[test]
-    fn an_inserted_feedrate_hands_back_the_rate_the_file_asked_for() {
-        // Rounding the restore to whole mm/min hands the print a speed it
-        // never asked for, and anything under half a unit comes back as `F0`.
-        let source = middle_layer(
-            ";TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E0.5\n\
-             G1 X9.55 Y9.55 E0.5\n\
-             G1 X0.45 Y9.55 E0.5\n\
-             G1 X0.45 Y0.45 E0.5\n\
-             G1 X0 Y0 F9000 ; travel\n\
-             G1 F1799.5\n\
-             G1 X10 Y0 E0.5\n\
-             G1 X10 Y10 E0.5\n\
-             G1 X0 Y10 E0.5\n\
-             G1 X0 Y0 E0.5\n",
-        );
-        let out = run(&source, &Config::default());
-        assert!(
-            out.contains("G1 F1799.5 ; bricklayers brick resume"),
-            "the restored feedrate was rounded:\n{out}"
-        );
-    }
-
-    /// A slicer drops progress, fan, acceleration, tool and origin codes
-    /// between the layer's `G1 Z` and the wall that follows it. Ending the
-    /// held tail on one of those wrote the travel out before the raise could
-    /// ride it, so the raise fell back to a `G1 Z` of its own — on the loop's
-    /// start point, primed, which is the seam. Measured on a stock OrcaSlicer
-    /// file it cost 2 of 132 raises, and 132 of 132 once an `M73` followed
-    /// every layer's `G1 Z`.
-    #[test]
-    fn a_height_change_still_rides_a_travel_across_an_interrupting_command() {
-        for interruption in ["M73 P1 R1", "M106 S255", "M204 S500", "T0", "G92 E0"] {
-            // The loop's travel has to sit before the interruption, as it does
-            // in a real file: the slicer reaches the wall, then declares the
-            // region, and the first loop has no move of its own left.
-            let loops = wall(3, "loop");
-            let (travel, rest) = loops.split_once('\n').expect("a wall opens with a travel");
-            let body = format!("{travel}\n{interruption}\n;TYPE:Perimeter\n{rest}");
-            let same = untagged(&body);
-            let source = relative(&format!(
-                "{}{same}{}{same}{}{same}{}{body}{}{same}",
-                layer(0.2),
-                layer(0.4),
-                layer(0.6),
-                layer(0.8),
-                layer(1.0),
-            ));
-
-            let out = run(&source, &Config::default());
-            let halts = out
-                .lines()
-                .filter(|line| line.starts_with("G1 Z") && line.ends_with("raised"))
-                .count();
-            assert_eq!(halts, 0, "{interruption} cost a raise its carrier:\n{out}");
-            assert!(
-                out.contains("Z0.900 ; bricklayers brick raised"),
-                "{interruption}: nothing was raised at all:\n{out}"
-            );
-            assert!(
-                out.contains(&format!("\n{interruption}\n")),
-                "{interruption} was dropped:\n{out}"
-            );
-        }
-    }
-
-    /// The same, in absolute mode, where a `G92` also has to keep the stream
-    /// honest: the origin is read when the line is parsed but only reaches the
-    /// output when the buffered tail is written, so the two halves move apart.
-    #[test]
-    fn a_g92_between_the_layer_and_the_wall_keeps_the_carrier_and_the_origin() {
-        let loops = wall_of(3, "loop", 0.0, 10.0, 1.0);
-        let (travel, rest) = loops.split_once('\n').expect("a wall opens with a travel");
-        let body = format!("{travel}\nG92 E0\n;TYPE:Perimeter\n{rest}");
-        let same = untagged(&body);
-        let source = format!(
-            "; layer_height = 0.2\nM82\n{}{same}{}{same}{}{same}{}{body}{}{same}",
-            layer(0.2),
-            layer(0.4),
-            layer(0.6),
-            layer(0.8),
-            layer(1.0),
-        );
-
-        let out = run(&source, &Config::default());
-        let halts = out
-            .lines()
-            .filter(|line| line.starts_with("G1 Z") && line.ends_with("raised"))
-            .count();
-        assert_eq!(halts, 0, "the reset cost the raise its carrier:\n{out}");
-
-        // Every absolute value after the last reset is measured from the new
-        // zero, so none of them may jump or run backwards.
-        let after = out.rsplit_once("\nG92 E0\n").expect("the reset is kept").1;
-        let mut position = 0.0;
-        for line in after.lines() {
-            let parsed = Line::parse(line);
-            let Some(e) = parsed.e.filter(|_| parsed.draws()) else {
-                continue;
-            };
-            assert!(
-                e >= position && e - position <= 1.5,
-                "{line} asks for {} mm in one move:\n{out}",
-                e - position
-            );
-            position = e;
-        }
-    }
-
-    #[test]
-    fn inserted_z_moves_fall_back_when_the_file_never_moves_z_alone() {
-        let source = relative(&format!(
-            ";LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.2 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.4 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.6 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.8 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Solid infill\nG1 X0 Y0 Z1.0 F9000\nG1 X10 Y0 E0.5\n",
-            wall(2, "loop"),
-            wall(2, "second"),
-            wall(2, "third"),
-            wall(2, "above")
-        ));
-        let out = run(&source, &Config::default());
-        // Nothing here moves Z on its own, so the closing reset — which has no
-        // travel left to ride — falls back to the built-in feedrate.
-        assert!(
-            out.contains("G1 Z0.600 F720 ; bricklayers brick reset"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn a_wall_that_starts_partway_up_climbs_from_where_it_starts() {
-        // The mirror of a wall that ends: a column beginning on solid infill —
-        // the underside of a shelf, the roof of a bridged hole — has no seam
-        // under its first bead. Raising that bead by the full offset asks it
-        // to span a layer and a half of gap the slicer metered for one, which
-        // leaves a void. It has to climb from where it begins, exactly as a
-        // column standing on the bed does.
-        let body = format!(";TYPE:Perimeter\n{}", wall(2, "loop"));
-        let mut source = String::new();
-        // Two layers of solid infill, so the wall above them is supported
-        // material but stands on no column of its own.
-        for z in [0.2, 0.4] {
-            source.push_str(&layer(z));
-            source.push_str(";TYPE:Solid infill\nG1 X0 Y0 F9000\nG1 X10 Y0 E0.5\n");
-        }
-        for z in [0.6, 0.8, 1.0, 1.2, 1.4] {
-            source.push_str(&layer(z));
-            source.push_str(&untagged(&body));
-        }
-        let out = run(&relative(&source), &plain());
-        let raises: Vec<&str> = out
-            .lines()
-            .filter(|line| line.ends_with("raised"))
-            .map(|line| &line[line.find(" Z").expect("a height") + 2..line.len() - 27])
-            .collect();
-        // Nothing on the layer the column starts at, then a quarter and a half
-        // of the layer as it climbs, then the offset it keeps.
-        assert_eq!(raises, ["0.850", "1.100", "1.300"], "{out}");
-        // The climbing beads are metered for the ground they gained; the one
-        // above them spans exactly its own layer.
-        assert!(out.contains("E0.62500"), "a climbing bead: {out}");
-        assert!(
-            out.contains("G1 X10.00 Y0.00 E0.5"),
-            "the bead that starts the column is left as sliced: {out}"
-        );
-    }
-
-    #[test]
-    fn a_wall_that_ends_partway_up_is_capped_while_its_neighbour_carries_on() {
-        // A shoulder: one column of wall runs on to the top of the part and
-        // another stops here, closed by a surface printed at the next plane.
-        // That surface is metered for a whole layer, so a bead left raised
-        // under it fills half the gap with twice the material. Measured on the
-        // real slice this came from, 293.8 mm of a 399.0 mm top surface sat on
-        // a bead 0.1 mm proud.
-        let on = wall_of(2, "on", 0.0, 10.0, 0.5);
-        let ends = wall_of(2, "end", 20.0, 10.0, 0.5);
-        let both = untagged(&format!(";TYPE:Perimeter\n{on}{ends}"));
-        let mut source = String::new();
-        // Both columns run up from the bed, or the layer under test would be
-        // where they begin rather than where one of them ends.
-        for z in [0.2, 0.4, 0.6, 0.8] {
-            source.push_str(&layer(z));
-            source.push_str(&both);
-        }
-        source.push_str(&layer(1.0));
-        source.push_str(&format!(";TYPE:Perimeter\n{on}{ends}"));
-        source.push_str(&layer(1.2));
-        source.push_str(&format!(";TYPE:Perimeter\n{}", untagged(&on)));
-        source.push_str(";TYPE:Solid infill\nG1 X20 Y20 F9000\nG1 X30 Y20 E0.5\nG1 X30 Y30 E0.5\n");
-        let source = relative(&source);
-        let out = run(&source, &plain());
-        assert_eq!(
-            loop_states(&out),
-            vec![
-                ("on1".to_owned(), false),
-                ("on2".to_owned(), true),
-                ("end1".to_owned(), false),
-                ("end2".to_owned(), false),
-            ],
-            "only the wall that stops is capped: {out}"
-        );
-        assert!(
-            out.contains("E0.25000 ; end2"),
-            "and it gives back the half layer its column took: {out}"
-        );
-    }
-
-    #[test]
-    fn the_top_layer_caps_the_wall_flat() {
-        // Raising here would stand a bead half a layer proud of the top
-        // surface beside it, and meter it for half a gap that is a whole one.
-        let body = format!(";TYPE:Perimeter\n{}", wall(2, "loop"));
-        let same = untagged(&body);
-        let source = relative(&format!(
-            "{}{same}{}{same}{}{same}{}{body}{}",
-            layer(0.2),
-            layer(0.4),
-            layer(0.6),
-            layer(0.8),
-            ";TYPE:Top solid infill\nG1 X40 Y0 E0.5\n"
-        ));
-        let out = run(&source, &plain());
-        assert_eq!(
-            loop_states(&out),
-            vec![("loop1".to_owned(), false), ("loop2".to_owned(), false)],
-            "the top layer must stay on the plane: {out}"
-        );
-        assert!(
-            out.contains("E0.25000 ; loop2"),
-            "and still meter the half gap the raised loop below left: {out}"
-        );
-    }
-
-    #[test]
-    fn the_layer_that_tops_a_wall_caps_it_though_the_file_goes_on() {
-        // What closes a part is solid infill laid over its walls, so the last
-        // wall is a layer or more below the last layer. Measured on six real
-        // slices: one to five layers below, so testing the layer count capped
-        // nothing at all and left every part's topmost wall standing proud.
-        let body = format!(";TYPE:Perimeter\n{}", wall(2, "loop"));
-        let same = untagged(&body);
-        let source = relative(&format!(
-            "{}{same}{}{same}{}{same}{}{body}{}{}",
-            layer(0.2),
-            layer(0.4),
-            layer(0.6),
-            layer(0.8),
-            layer(1.0),
-            ";TYPE:Top solid infill\nG1 X40 Y0 E0.5\n"
-        ));
-        let out = run(&source, &plain());
-        assert_eq!(
-            loop_states(&out),
-            vec![("loop1".to_owned(), false), ("loop2".to_owned(), false)],
-            "the wall's top layer must stay on the plane: {out}"
-        );
-        assert!(
-            out.contains("E0.25000 ; loop2"),
-            "and still meter the half gap the raised loop below left: {out}"
-        );
-    }
-
-    #[test]
-    fn tracks_a_layer_z_that_arrives_inside_a_perimeter_region() {
-        // Klipper flavour, and Orca with Z-hop off, fold the layer's Z into the
-        // travel that reaches the first loop rather than emitting it alone.
-        let source = relative(&format!(
-            ";LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.2 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.4 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.6 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.8 F9000\n{}\
-             ;LAYER_CHANGE\n;TYPE:Solid infill\nG1 X0 Y0 Z1.0 F9000\nG1 X10 Y0 E0.5\n",
-            wall(2, "first"),
-            wall(2, "second"),
-            wall(2, "third"),
-            wall(2, "above"),
-        ));
-        let out = run(&source, &Config::default());
-        assert!(
-            out.contains("G1 X0.00 Y0.00 F9000 Z0.450 ; bricklayers brick raised"),
-            "{out}"
-        );
-        assert!(
-            out.contains("G1 X0.00 Y0.00 F9000 Z0.700 ; bricklayers brick raised"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("G1 Z0.000"),
-            "drove the nozzle into the bed: {out}"
-        );
-        assert!(
-            !out.contains("G1 Z0.100"),
-            "shifted off a stale layer Z: {out}"
-        );
-    }
-
-    #[test]
-    fn a_loop_that_does_not_touch_the_last_one_starts_a_new_contour() {
-        // One region holding a three-loop wall and then a two-loop hole well
-        // away from it. The wall's loops run beside each other and keep the
-        // alternation going; the hole touches nothing, so it opens raised
-        // despite following an odd loop count.
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(3, "wall", 0.0, 10.0, 0.5),
-            wall_of(2, "hole", 50.0, 4.0, 0.5),
-        ));
-        let out = run(&source, &Config::default());
-        assert_eq!(
-            loop_states(&out),
-            vec![
-                ("wall1".to_owned(), true),
-                ("wall2".to_owned(), false),
-                ("wall3".to_owned(), true),
-                ("hole1".to_owned(), false),
-                ("hole2".to_owned(), true),
-            ],
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn an_open_wall_alternates_though_its_loops_do_not_nest() {
-        // Most of a wall is not a closed ring. Where a slicer follows a curved
-        // surface the loops are arcs, each one offset sideways from the last
-        // and often longer than it, so neither encloses the other. They are
-        // still the same wall, and grouping them by what they enclose leaves
-        // almost every loop of a real print on its own.
-        let mut arcs = String::new();
-        for index in 0..4 {
-            let x = 0.45 * index as f64;
-            let reach = 4.0 + index as f64;
-            arcs.push_str(&format!("G1 X{x:.2} Y0 F9000\n"));
-            arcs.push_str(&format!("G1 X{x:.2} Y{reach:.2} E0.5 ; arc{}\n", index + 1));
-        }
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{arcs}"));
-        let outcome = apply(&source, &Config::default());
-        // Four per layer, on each of the five layers the fixture repeats the
-        // wall over so that this one stands on a column and carries one.
-        assert_eq!(outcome.stats.loops, 20);
-        assert_eq!(
-            outcome.stats.raised, 6,
-            "one wall, so every other arc: {}",
-            outcome.gcode
-        );
-    }
-
-    #[test]
-    fn a_retraction_between_a_wall_s_own_loops_does_not_split_it() {
-        // Slicers retract and hop between neighbouring loops of one wall
-        // whenever the seams are far apart, which must not read as a new
-        // contour: the two loops still have to alternate.
-        let source = middle_layer(
-            ";TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E0.5 ; inner\n\
-             G1 X9.55 Y9.55 E0.5\n\
-             G1 X0.45 Y9.55 E0.5\n\
-             G1 X0.45 Y0.45 E0.5\n\
-             G1 E-0.8 F2100\n\
-             G1 X20 Y20 F9000\n\
-             G1 X0 Y0 F9000\n\
-             G1 E0.8 F2100\n\
-             G1 X10 Y0 E0.5 ; outer\n\
-             G1 X10 Y10 E0.5\n\
-             G1 X0 Y10 E0.5\n\
-             G1 X0 Y0 E0.5\n",
-        );
-        let config = Config {
-            wall_flow: Some(2.0),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        assert_eq!(
-            loop_states(&out),
-            vec![("inner".to_owned(), false), ("outer".to_owned(), true)],
-            "the retraction must not split the wall: {out}"
-        );
-    }
-
-    #[test]
-    fn a_layer_change_ends_the_region_it_interrupts() {
-        // OrcaSlicer opens the next layer's wall with a stray segment before it
-        // re-declares the region. Carrying the old region across the layer
-        // change would buffer that segment as a perimeter loop of its own, at
-        // the new layer's Z.
-        let source = relative(&format!(
-            ";LAYER_CHANGE\nG1 Z0.20 F600\n;TYPE:Perimeter\n{}\
-             ;LAYER_CHANGE\nG1 Z0.40 F600\nG1 X20 Y20 E0.01 ; stray\n\
-             ;TYPE:Perimeter\n{}",
-            wall(2, "first"),
-            wall(2, "second"),
-        ));
-        let outcome = apply(&source, &Config::default());
-        assert!(
-            outcome.gcode.contains("G1 X20 Y20 E0.01 ; stray\n"),
-            "{}",
-            outcome.gcode
-        );
-        assert_eq!(outcome.stats.loops, 4, "the stray segment is not a loop");
-    }
-
-    #[test]
-    fn a_loop_that_opens_with_an_arc_is_raised_whole() {
-        // Arc fitting replaces a run of short segments with one G2/G3, often at
-        // the very start of a loop. Treating that as part of the travel would
-        // print it before the nozzle rises, at the height of the loop below.
-        let source = middle_layer(
-            ";TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E0.5\n\
-             G1 X9.55 Y9.55 E0.5\n\
-             G1 X0.45 Y9.55 E0.5\n\
-             G1 X0.45 Y0.45 E0.5\n\
-             G1 X0 Y0 F9000\n\
-             G2 X10 Y0 I5 J1 E0.5 ; outer opens\n\
-             G1 X10 Y10 E0.5\n\
-             G1 X0 Y10 E0.5\n\
-             G1 X0 Y0 E0.5\n",
-        );
-        let out = run(&source, &Config::default());
-        let raise = out
-            .find("Z0.900 ; bricklayers brick raised")
-            .expect("the wall is raised");
-        let arc = out.find("; outer opens").expect("arc kept");
-        assert!(
-            raise < arc,
-            "the arc opens the loop, so it rises with it:\n{out}"
-        );
-    }
-
-    #[test]
-    fn a_contour_holding_one_loop_is_raised_against_the_wall_that_shows() {
-        // A lone loop has no internal neighbour, but it was inset from an
-        // external perimeter, so the visible wall is what it staggers against.
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(1, "lone")));
-        let outcome = apply(&source, &Config::default());
-        assert_eq!(
-            loop_states(&outcome.gcode),
-            vec![("lone1".to_owned(), true)]
-        );
-        // The other four are the fixture's own wall on the layers around it.
-        assert_eq!(outcome.stats.loops, 5);
-        // The bed layer stays flat and the top one is capped, so the three in
-        // between are raised.
-        assert_eq!(outcome.stats.raised, 3);
-    }
-
-    #[test]
-    fn a_solid_wall_three_beads_thick_bricks_its_single_inner_bead() {
-        // The case a thin rib produces: the visible wall wraps both faces and
-        // one internal loop runs down the middle. Raising it keys the rib to
-        // the wall on either side, and the wall itself must stay on the plane.
-        let source = middle_layer(
-            ";TYPE:Perimeter\n\
-             G1 X0.70 Y0.68 F9000\n\
-             G1 X39.30 Y0.68 E1.0 ; rib1\n\
-             ;TYPE:External perimeter\n\
-             G1 X0.22 Y0.22 F9000\n\
-             G1 X39.78 Y0.22 E1.0 ; skin1\n\
-             G1 X39.78 Y1.13 E0.1\n\
-             G1 X0.22 Y1.13 E1.0\n\
-             G1 X0.22 Y0.22 E0.1\n",
-        );
-        let outcome = apply(&source, &Config::default());
-        assert_eq!(
-            loop_states(&outcome.gcode),
-            vec![("rib1".to_owned(), true), ("skin1".to_owned(), false)],
-            "{}",
-            outcome.gcode
-        );
-        assert_eq!(outcome.stats.raised, 3);
-    }
-
-    #[test]
-    fn a_lone_hole_is_bricked_beside_a_wall_in_the_same_region() {
-        // Numbering restarts per contour, so a two-loop wall and the
-        // single-loop hole beside it are each anchored on their own
-        // external-adjacent end.
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(2, "wall", 0.0, 10.0, 0.5),
-            wall_of(1, "hole", 50.0, 4.0, 0.5),
-        ));
-        let config = Config {
-            wall_flow: Some(2.0),
-            ..Config::default()
-        };
-        let outcome = apply(&source, &config);
-        assert!(
-            outcome.gcode.contains("E1.00000 ; wall2"),
-            "{}",
-            outcome.gcode
-        );
-        assert!(
-            outcome.gcode.contains("E1.00000 ; hole1"),
-            "{}",
-            outcome.gcode
-        );
-        assert_eq!(outcome.stats.loops, 15);
-        assert_eq!(outcome.stats.raised, 6);
-    }
-
-    #[test]
-    fn restores_z_before_leaving_the_perimeter_region() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{};TYPE:Solid infill\nG1 X40 Y0 E0.5\n",
-            wall(2, "loop")
-        ));
-        let out = run(&source, &Config::default());
-        // The fixture repeats the wall on every layer, so anchor on the
-        // tagged one rather than on the file's first solid infill.
-        let tail = &out[out.find("; loop2").expect("tagged loop kept")..];
-        let reset = tail.find("bricklayers brick reset").expect("reset emitted");
-        let infill = tail.find(";TYPE:Solid infill").expect("marker kept");
-        assert!(reset < infill, "Z must drop before infill starts:\n{out}");
-    }
-
-    /// The visible wall is never raised, and a file that states no width for
-    /// it has nothing to move it by, so it comes through exactly as sliced.
-    #[test]
-    fn external_perimeters_are_never_raised() {
-        let source = middle_layer(";TYPE:External perimeter\nG1 X10 Y0 E0.5\nG1 X20 Y0 E0.5\n");
-        assert!(!run(&source, &Config::default()).contains("bricklayers"));
-    }
-
-    /// The multiplier is a flow for the hidden walls, not compensation owed to
-    /// the raise, so the loop left on the plane is scaled beside the one that
-    /// was raised.
-    #[test]
-    fn every_internal_wall_is_metered_at_the_multiplier() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}",
-            wall_of(2, "loop", 0.0, 10.0, 1.0)
-        ));
-        let config = Config {
-            wall_flow: Some(1.5),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        assert!(out.contains("E1.50000 ; loop2"), "raised loop:\n{out}");
-        assert!(out.contains("E1.50000 ; loop1"), "flat loop:\n{out}");
-        assert!(!out.contains("E1 ; loop"), "nothing left as sliced:\n{out}");
-    }
-
-    /// Everything the eye lands on that is not a wall is left alone: the solid
-    /// surfaces that close the part top and bottom, and the infill between
-    /// them, are not perimeters and are never rescaled.
-    #[test]
-    fn the_surfaces_that_show_are_left_as_sliced() {
-        let source = middle_layer(&format!(
-            ";TYPE:Top solid infill\nG1 X0 Y-2 F9000\nG1 X10 Y-2 E1.0 ; ceiling\n\
-             ;TYPE:Internal infill\nG1 X0 Y-3 F9000\nG1 X10 Y-3 E1.0 ; fill\n\
-             ;TYPE:Perimeter\n{}",
-            wall_of(2, "loop", 0.0, 10.0, 1.0)
-        ));
-        let config = Config {
-            wall_flow: Some(1.5),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        for tag in ["ceiling", "fill"] {
-            assert!(
-                out.contains(&format!("E1.0 ; {tag}")),
-                "{tag} moved:\n{out}"
-            );
-        }
-        assert!(out.contains("E1.50000 ; loop1"), "wall scaled:\n{out}");
-    }
-
-    /// A bead on the plate is pressed by the plate rather than by a layer, so
-    /// surplus flow there has nowhere to go but sideways.
-    #[test]
-    fn the_layer_on_the_bed_is_left_as_sliced() {
-        let mut source = String::from("; layer_height = 0.2\nM83\n");
-        for index in 0..5 {
-            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
-            source.push_str(";TYPE:Perimeter\n");
-            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
-        }
-        let config = Config {
-            wall_flow: Some(1.5),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        assert!(out.contains("E1 ; L0loop1"), "bed layer, flat loop:\n{out}");
-        assert!(
-            out.contains("E1 ; L0loop2"),
-            "bed layer, raised loop:\n{out}"
-        );
-        assert!(
-            out.contains("E1.50000 ; L3loop1"),
-            "the layers above:\n{out}"
-        );
-    }
-
-    /// A file handed no settings at all still gets the shipped slope, and the
-    /// arithmetic of the raise is unchanged by it.
-    #[test]
-    fn the_shipped_default_meters_the_hidden_walls_over() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}",
-            wall_of(2, "loop", 0.0, 10.0, 1.0)
-        ));
-        assert_eq!(Config::default().wall_flow, None);
-        assert_eq!(Config::default().extra_flow, DEFAULT_EXTRA_FLOW);
-        let out = run(&source, &Config::default());
-        assert!(out.contains("E1.02500 ; loop1"), "{out}");
-        assert!(out.contains("E1.02500 ; loop2"), "{out}");
-    }
-
-    /// The reference profile is the anchor: its layer is half its nozzle, so
-    /// it takes half of whatever slope is set. A file that states no width is
-    /// metered as if it were that profile.
-    #[test]
-    fn the_reference_profile_takes_half_the_slope() {
-        let flow = |width| automatic_flow(0.2, width, DEFAULT_EXTRA_FLOW);
-        assert_eq!(flow(Some(0.45)), 1.025);
-        assert_eq!(flow(None), 1.025);
-        assert_eq!(automatic_flow(0.2, Some(0.45), 0.10), 1.05);
-        assert_eq!(automatic_flow(0.2, Some(0.45), 0.0), 1.0);
-    }
-
-    /// The corner two beads leave between them is as tall as the layer and as
-    /// wide as what is left of the spacing, so the share of a bead sitting in
-    /// one — and the flow that pays for it — rises with the layer height and
-    /// falls as the wall widens.
-    #[test]
-    fn the_flow_follows_the_layer_height_against_the_wall_width() {
-        let round = |value: f64| (value * 1000.0).round() / 1000.0;
-        let flow = |height, width| automatic_flow(height, width, DEFAULT_EXTRA_FLOW);
-        assert_eq!(round(flow(0.1, Some(0.45))), 1.012);
-        assert_eq!(round(flow(0.28, Some(0.45))), 1.037);
-        assert_eq!(round(flow(0.2, Some(0.35))), 1.033);
-        assert_eq!(round(flow(0.2, Some(0.65))), 1.017);
-        // A 0.8 mm nozzle at a fine layer has barely any junction to pay for.
-        assert_eq!(round(flow(0.15, Some(0.85))), 1.009);
-    }
-
-    /// Every number reaching the nozzle is held to what a printer can act on,
-    /// and a settings block is not a trustworthy source of any of them.
-    #[test]
-    fn a_width_a_bead_cannot_have_falls_back_to_the_shipped_flow() {
-        for impossible in [
-            Some(0.0),
-            Some(-0.45),
-            Some(f64::NAN),
-            Some(f64::INFINITY),
-            // Narrower than the caps the layer's own height gives the bead, so
-            // the spacing works out at zero or less.
-            Some(0.04),
-            None,
-        ] {
-            assert_eq!(
-                automatic_flow(0.2, impossible, DEFAULT_EXTRA_FLOW),
-                1.025,
-                "{impossible:?}"
-            );
-        }
-        for impossible in [0.0, -0.2, f64::NAN] {
-            assert_eq!(
-                automatic_flow(impossible, Some(0.45), DEFAULT_EXTRA_FLOW),
-                1.025,
-                "{impossible}"
-            );
-        }
-        // A slope that is not a number falls back to the shipped one, and
-        // nothing derived may ask for more than a bead's neighbour can take.
-        assert_eq!(automatic_flow(0.2, Some(0.45), f64::NAN), 1.025);
-        assert_eq!(automatic_flow(0.2, Some(0.45), -1.0), 1.0);
-        // A 0.3 mm layer through a 0.1 mm line is beads already laid past one
-        // another's centres, so the ceiling floors out and it takes no extra.
-        assert_eq!(automatic_flow(0.3, Some(0.1), 1e9), 1.0);
-    }
-
-    /// The ceiling is a guard against a width no slicer would state, not a
-    /// setting anyone prints against, so pin that it stays out of the way over
-    /// every geometry a slicer will produce: nozzles from 0.2 to 1.2 mm,
-    /// widths out to 1.2× the nozzle, and layers from a tenth of it to four
-    /// fifths. The bead only reaches its neighbour's centre past `h/s` of
-    /// 1.38, and the widest layer in that sweep is four fifths of a nozzle
-    /// narrower than its own line.
-    #[test]
-    fn the_flow_ceiling_never_binds_on_a_geometry_a_slicer_produces() {
-        let (mut span, mut bound) = (0, 0);
-        for nozzle in [0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.2] {
-            for wide in 0..=20 {
-                let width = nozzle * (1.0 + f64::from(wide) / 100.0);
-                for thick in 10..=80 {
-                    let height = nozzle * f64::from(thick) / 100.0;
-                    let ceiling = flow_ceiling(height, bead_spacing(height, width));
-                    span += 1;
-                    bound +=
-                        usize::from(automatic_flow(height, Some(width), MAX_EXTRA_FLOW) >= ceiling);
-                }
-            }
-        }
-        assert_eq!(bound, 0, "{bound} of {span} reached the ceiling");
-        // It is still a real limit. A 0.4 mm layer laid at a 0.37 mm line is
-        // a bead nearly as tall as the gap beside it, and the top of the dial
-        // is held back to what that gap can take.
-        let (height, width) = (0.4, 0.37);
-        assert_eq!(
-            automatic_flow(height, Some(width), MAX_EXTRA_FLOW),
-            flow_ceiling(height, bead_spacing(height, width))
-        );
-    }
-
-    /// The width the file states is the one the flow is read from, so a
-    /// profile that lays wider beads pays less for the same layer.
-    #[test]
-    fn the_width_the_file_states_sets_the_flow() {
-        let walls = format!(";TYPE:Perimeter\n{}", wall_of(2, "loop", 0.0, 10.0, 1.0));
-        let narrow = run(
-            &format!("; inner_wall_line_width = 0.35\n{}", middle_layer(&walls)),
-            &Config::default(),
-        );
-        let wide = run(
-            &format!(
-                "; perimeter_extrusion_width = 0.65\n{}",
-                middle_layer(&walls)
-            ),
-            &Config::default(),
-        );
-        assert!(narrow.contains("E1.03314 ; loop1"), "{narrow}");
-        assert!(wide.contains("E1.01676 ; loop1"), "{wide}");
-    }
-
-    /// The flow is read per layer, not once per file, so a slice whose layers
-    /// vary meters each of them for the seam it actually has. A thick layer
-    /// leaves more of each bead in the corner beside it than a thin one.
-    #[test]
-    fn an_adaptive_slice_meters_each_layer_at_its_own_flow() {
-        let walls = |tag: &str| format!(";TYPE:Perimeter\n{}", wall_of(2, tag, 0.0, 10.0, 1.0));
-        let mut source = String::from("; inner_wall_line_width = 0.45\nM83\n");
-        // Heights of 0.1 and 0.3 either side of the reference, laid down as
-        // planes so the survey measures them rather than reading a nominal.
-        for (index, z) in [0.2, 0.3, 0.4, 0.7, 1.0, 1.1].into_iter().enumerate() {
-            source.push_str(&layer(z));
-            source.push_str(&walls(&format!("L{index}loop")));
-        }
-        let outcome = apply(&source, &Config::default());
-        let out = outcome.gcode;
-
-        assert!(outcome.stats.flow.is_some(), "{:?}", outcome.stats);
-        let (low, high) = outcome.stats.flow.expect("walls were metered");
-        let asks = |height| automatic_flow(height, Some(0.45), DEFAULT_EXTRA_FLOW);
-        assert!(
-            (low - asks(0.1)).abs() < 1e-9 && (high - asks(0.3)).abs() < 1e-9,
-            "{low} to {high}"
-        );
-        // Layer 3 is 0.3 mm over a 0.4 mm plane, layer 1 is 0.1 mm over 0.2.
-        assert!(out.contains("E1.03959 ; L3loop1"), "thick layer:\n{out}");
-        assert!(out.contains("E1.01187 ; L1loop1"), "thin layer:\n{out}");
-    }
-
-    /// The dial names the slope, not the answer: it is the extra a wall takes
-    /// where the layer is as thick as the nozzle, and the geometry decides
-    /// where on that line each layer sits.
-    #[test]
-    fn the_dial_is_the_extra_a_layer_as_thick_as_the_nozzle_takes() {
-        let source = format!(
-            "; inner_wall_line_width = 0.45\n{}",
-            middle_layer(&format!(
-                ";TYPE:Perimeter\n{}",
-                wall_of(2, "loop", 0.0, 10.0, 1.0)
-            ))
-        );
-        let flow = |extra: f64| {
-            let config = Config {
-                extra_flow: extra,
-                ..Config::default()
-            };
-            let out = run(&source, &config);
-            let bead = out
-                .lines()
-                .find(|line| line.ends_with("; loop1"))
-                .unwrap_or_else(|| panic!("a hidden wall:\n{out}"))
-                .to_owned();
-            Line::parse(&bead).e.expect("an E word")
-        };
-        // A 0.2 mm layer is half of the 0.4 mm nozzle, so it takes half.
-        assert!((flow(0.05) - 1.025).abs() < 1e-9, "{}", flow(0.05));
-        assert!((flow(0.10) - 1.05).abs() < 1e-9, "{}", flow(0.10));
-        assert!((flow(0.02) - 1.01).abs() < 1e-9, "{}", flow(0.02));
-        // Zero is the raise and nothing else: metered exactly as sliced.
-        assert_eq!(flow(0.0), 1.0);
-    }
-
-    /// An adaptive slice still meters every layer for its own height whatever
-    /// the slope is set to — the dial tilts the line, it does not replace it
-    /// with a constant.
-    #[test]
-    fn the_dial_keeps_a_layer_metered_for_its_own_height() {
-        let walls = |tag: &str| format!(";TYPE:Perimeter\n{}", wall_of(2, tag, 0.0, 10.0, 1.0));
-        let mut source = String::from("; inner_wall_line_width = 0.45\nM83\n");
-        for (index, z) in [0.2, 0.3, 0.4, 0.7, 1.0, 1.1].into_iter().enumerate() {
-            source.push_str(&layer(z));
-            source.push_str(&walls(&format!("L{index}loop")));
-        }
-        let config = Config {
-            extra_flow: 0.025,
-            ..Config::default()
-        };
-        let outcome = apply(&source, &config);
-        let (low, high) = outcome.stats.flow.expect("walls were metered");
-        let asks = |height| automatic_flow(height, Some(0.45), 0.025);
-        assert!(
-            (low - asks(0.1)).abs() < 1e-9 && (high - asks(0.3)).abs() < 1e-9,
-            "{low} to {high}"
-        );
-        assert!(low < high, "the layers must still differ: {low} to {high}");
-    }
-
-    /// The visible wall is moved by half the width the flow adds, so turning
-    /// the flow down moves it less. Scaling one without the other would grow
-    /// or shrink the part.
-    #[test]
-    fn the_visible_wall_moves_with_the_dial() {
-        let walls = format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        );
-        let source = format!(
-            "; external_perimeter_extrusion_width = 0.4\n; inner_wall_line_width = 0.45\n{}",
-            middle_layer(&walls)
-        );
-        let inset = |extra: f64| {
-            let config = Config {
-                extra_flow: extra,
-                ..Config::default()
-            };
-            let out = run(&source, &config);
-            let bead = out
-                .lines()
-                .find(|line| line.ends_with("; skin1"))
-                .unwrap_or_else(|| panic!("the visible wall:\n{out}"))
-                .to_owned();
-            Line::parse(&bead).y.expect("a Y")
-        };
-        // Half of (flow - 1) times the spacing the 0.4 mm wall is laid at,
-        // 0.357 at these layers, on the three-decimal grid a coordinate is
-        // written to: 0.0045 at the shipped slope, and half of that, 0.0022,
-        // lands on 0.002.
-        assert_eq!(inset(0.05), 0.004);
-        assert_eq!(inset(0.025), 0.002);
-        assert_eq!(inset(0.10), 0.009);
-        // No extra flow is no extra width, so there is nothing to move.
-        assert_eq!(inset(0.0), 0.0);
-    }
-
-    /// Nothing a library caller passes may reach the nozzle as a coordinate it
-    /// cannot act on, and `f64::clamp` hands NaN straight back. A number past
-    /// the range is pulled into it, and the flow ceiling holds whatever is
-    /// left.
-    #[test]
-    fn a_slope_a_printer_cannot_act_on_is_ignored() {
-        let source = format!(
-            "; inner_wall_line_width = 0.45\n{}",
-            middle_layer(&format!(
-                ";TYPE:Perimeter\n{}",
-                wall_of(2, "loop", 0.0, 10.0, 1.0)
-            ))
-        );
-        for impossible in [f64::NAN, f64::INFINITY, -1.0, 1e9] {
-            let config = Config {
-                extra_flow: impossible,
-                ..Config::default()
-            };
-            let out = run(&source, &config);
-            assert!(!out.contains("NaN"), "{impossible}");
-            let top = automatic_flow(0.2, Some(0.45), MAX_EXTRA_FLOW);
-            let (low, high) = apply(&source, &config).stats.flow.expect("metered");
-            assert!(
-                (1.0..=top).contains(&low) && (1.0..=top).contains(&high),
-                "{impossible} gave {low} to {high}"
-            );
-        }
-    }
-
-    /// A number on the command line is the answer, whatever the file states,
-    /// so a print can be tested at a flow the geometry would never pick.
-    #[test]
-    fn a_flow_given_on_the_command_line_overrides_the_file() {
-        let source = format!(
-            "; inner_wall_line_width = 0.35\n{}",
-            middle_layer(&format!(
-                ";TYPE:Perimeter\n{}",
-                wall_of(2, "loop", 0.0, 10.0, 1.0)
-            ))
-        );
-        let config = Config {
-            wall_flow: Some(1.1),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        assert!(out.contains("E1.10000 ; loop1"), "{out}");
-    }
-
-    /// The multiplier is booked apart from the flow the geometry asks for, so
-    /// a climbing or capped bead books only the percentage and not the step it
-    /// was already metered for.
-    #[test]
-    fn the_multiplier_is_booked_apart_from_the_flow_it_scales() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}",
-            wall_of(2, "loop", 0.0, 10.0, 1.0)
-        ));
-        let config = Config {
-            wall_flow: Some(1.05),
-            ..Config::default()
-        };
-        let outcome = apply(&source, &config);
-        // The fixture lays 40 mm metered for its own geometry, 8 mm of it on
-        // the bed, which is never scaled; 5% of the 32 mm above it is 1.6.
-        assert!(
-            (outcome.stats.multiplier_filament - 1.6).abs() < 1e-9,
-            "{:?}",
-            outcome.stats
-        );
-        assert!(
-            (outcome.stats.filament - 41.6).abs() < 1e-9,
-            "{:?}",
-            outcome.stats
-        );
-    }
-
-    #[test]
-    fn a_multiplier_of_one_leaves_every_bead_metered_as_sliced() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}",
-            wall_of(2, "loop", 0.0, 10.0, 1.0)
-        ));
-        let outcome = apply(&source, &plain());
-        assert_eq!(outcome.stats.multiplier_filament, 0.0);
-        assert!(outcome.gcode.contains("E1 ; loop2"), "{}", outcome.gcode);
-        assert!(outcome.gcode.contains("E1 ; loop1"), "{}", outcome.gcode);
-    }
-
-    /// The visible wall is brought toward the loop behind it by half of what
-    /// the multiplier would have added as flow, closing the same volume across
-    /// the staggered joint without putting more material into the part.
-    #[test]
-    fn the_visible_wall_is_drawn_in_toward_the_loop_behind_it() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        )));
-        let out = run(&source, &drawn_in());
-        // A 0.4 mm wall is laid 0.357 mm from its neighbour at these layers, so
-        // 1.3 of the flow widens it by 0.107 and it moves in by half of that,
-        // 0.054, on every side. The bead gains 1.3 of the flow it had, over a
-        // path 0.9893 of its old length.
-        assert!(out.contains("G1 X9.946 Y0.054 E1.28607 ; skin1"), "{out}");
-        assert!(out.contains("G1 X9.946 Y9.946 E1.28607"), "{out}");
-        assert!(out.contains("G1 X0.054 Y9.946 E1.28607"), "{out}");
-        assert!(out.contains("G1 X0.054 Y0.054 E1.28607"), "{out}");
-        // The travel that reaches the loop has to land where it now starts.
-        assert!(out.contains("G1 X0.054 Y0.054 F9000"), "{out}");
-    }
-
-    /// The offset and the flow are two halves of one answer, so where the flow
-    /// is derived the offset has to move with it. A file stating a wall width
-    /// the geometry reads a higher flow off draws the visible wall in further
-    /// than one stating a width it reads a lower flow off.
-    #[test]
-    fn the_visible_wall_follows_the_flow_the_file_asked_for() {
-        let walls = format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        );
-        let inset = |stated: &str| {
-            let source = format!(
-                "; external_perimeter_extrusion_width = 0.4\n; inner_wall_line_width = {stated}\n{}",
-                middle_layer(&walls)
-            );
-            let out = run(&source, &Config::default());
-            let bead = out
-                .lines()
-                .find(|line| line.ends_with("; skin1"))
-                .unwrap_or_else(|| panic!("the visible wall:\n{out}"))
-                .to_owned();
-            Line::parse(&bead).y.expect("a Y")
-        };
-        // Half of (flow - 1) times the 0.357 mm spacing the visible wall is
-        // laid at: 0.0059 at the narrow width against 0.0030 at the wide one.
-        let (narrow, wide) = (inset("0.35"), inset("0.65"));
-        assert!((narrow - 0.0059).abs() < 5e-4, "narrow wall at {narrow}");
-        assert!((wide - 0.0030).abs() < 5e-4, "wide wall at {wide}");
-        assert!(narrow > wide, "{narrow} should sit further in than {wide}");
-    }
-
-    /// A ring does not return exactly to where it started: a slicer stops the
-    /// last bead short so the two ends do not pile up at the seam. Measured
-    /// over 308 loops of two real OrcaSlicer files, every one lands 0.0385 to
-    /// 0.0411 mm short — the `seam_gap` default, a tenth of a 0.4 mm nozzle —
-    /// and not one closes to the micron this used to demand. On a real file
-    /// that left the visible wall scaled but never moved, which grows the part
-    /// by half the width every bead gained.
-    #[test]
-    fn a_ring_stopped_short_of_its_seam_is_still_moved() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            seamed_skin(0.04)
-        )));
-        let out = run(&source, &Config::default());
-        let bead = out
-            .lines()
-            .find(|line| line.ends_with("; skin1"))
-            .unwrap_or_else(|| panic!("the visible wall:\n{out}"));
-        // A 0.4 mm wall laid at 0.357 mm spacing, metered at the 1.025 its
-        // geometry asks for, moves 0.004 inward.
-        let moved = Line::parse(bead).y.expect("a Y");
-        assert!(
-            (moved - 0.004).abs() < 1e-9,
-            "a ring left 0.04 mm short must still be drawn in: {bead}"
-        );
-    }
-
-    /// The gap is there so the seam does not get a double bead, so offsetting
-    /// the ring must not quietly pull it shut. Every vertex the loop was drawn
-    /// through is offset, the closing one included.
-    #[test]
-    fn offsetting_a_ring_leaves_its_seam_gap_where_it_was() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            seamed_skin(0.04)
-        )));
-        let out = run(&source, &Config::default());
-        let beads: Vec<(f64, f64)> = out
-            .lines()
-            .skip_while(|line| !line.ends_with("; skin1"))
-            .take(4)
-            .map(|line| {
-                let parsed = Line::parse(line);
-                (parsed.x.expect("an X"), parsed.y.expect("a Y"))
-            })
-            .collect();
-        assert_eq!(beads.len(), 4, "the four beads of the wall:\n{out}");
-        let closes = beads[3];
-        // The loop now starts at (0.004, 0.004) and its last bead has to stop
-        // the same 0.04 short of it as the slicer left.
-        assert!(
-            (closes.0 - 0.004).abs() < 1e-9 && (closes.1 - 0.044).abs() < 1e-9,
-            "the seam gap must survive: {closes:?}"
-        );
-    }
-
-    /// An open fragment has no inside to move toward. A thin wall breaks into
-    /// them, and offsetting one drags a visible surface sideways for no
-    /// reason, so the two ends being a whole bead apart is where a ring stops
-    /// being a ring.
-    #[test]
-    fn an_open_fragment_is_left_exactly_where_it_was() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            // The stated width is 0.4, and 1 mm apart is well past it.
-            seamed_skin(1.0)
-        )));
-        let out = run(&source, &Config::default());
-        let bead = out
-            .lines()
-            .find(|line| line.ends_with("; skin1"))
-            .unwrap_or_else(|| panic!("the visible wall:\n{out}"));
-        assert_eq!(
-            Line::parse(bead).y.expect("a Y"),
-            0.0,
-            "an open fragment must not be moved: {bead}"
-        );
-    }
-
-    /// A bead widens about its own centre, so a wall moved in by half of what
-    /// it gains reaches further into the joint while the face the eye lands on
-    /// does not move at all. The part measures what it was sliced to measure.
-    #[test]
-    fn the_visible_wall_keeps_the_dimension_it_was_sliced_to() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        )));
-        let out = run(&source, &drawn_in());
-        let bead = out
-            .lines()
-            .find(|line| line.ends_with("; skin1"))
-            .expect("the visible wall");
-        let shifted = Line::parse(bead).y.expect("a Y");
-
-        let (nominal, flow, height) = (0.4, 1.3, 0.2);
-        // The area scales, not the nominal width, so the bead keeps its round
-        // caps and gains `flow - 1` of its spacing.
-        let widened =
-            flow * bead_spacing(height, nominal) + height * (1.0 - std::f64::consts::FRAC_PI_4);
-        let outer_face = |centre: f64, width: f64| centre - width / 2.0;
-        assert!(
-            // The coordinate itself is written on a micron grid.
-            (outer_face(shifted, widened) - outer_face(0.0, nominal)).abs() < 5e-4,
-            "the wall ran at 0.0 and now runs at {shifted}, and widening it by \
-             {} must leave its outer face where it was",
-            widened - nominal
-        );
-    }
-
-    /// Flow per mm is what the slicer metered plus what the widening asks for,
-    /// so a path a shade shorter carries proportionally less of it.
-    #[test]
-    fn a_wall_drawn_in_carries_the_filament_its_new_width_asks_for() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        )));
-        let out = run(&source, &drawn_in());
-        // Each side runs 9.893 of the 10 mm it did, at 1.3 the flow.
-        assert!(!out.contains("E1.00000 ; skin1"), "{out}");
-        assert!(out.contains("E1.28607 ; skin1"), "{out}");
-    }
-
-    /// A hole is emitted clockwise, so the same rule moves its wall out of the
-    /// hole and into the material around it.
-    #[test]
-    fn a_hole_is_opened_up_rather_than_closed() {
-        let mut hole = String::from(";TYPE:External perimeter\nG1 X0.00 Y0.00 F9000\n");
-        for (x, y) in [(0.0, 10.0), (10.0, 10.0), (10.0, 0.0), (0.0, 0.0)] {
-            hole.push_str(&format!("G1 X{x:.2} Y{y:.2} E1.0\n"));
-        }
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{hole}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0)
-        )));
-        let out = run(&source, &drawn_in());
-        assert!(
-            out.contains("G1 X-0.054 Y10.054"),
-            "a hole must open, not close:\n{out}"
-        );
-    }
-
-    /// A file that states no width still has its visible wall drawn in, on the
-    /// reference profile the flow already falls back to. Scaling a wall
-    /// without moving it grows the part by half of what it gained, so the two
-    /// halves of the change have to fall back together — Cura writes its
-    /// settings in a form nothing else parses, and this is that file.
-    #[test]
-    fn a_file_that_states_no_wall_width_falls_back_to_the_reference_profile() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        ));
-        let out = run(&source, &drawn_in());
-        // 0.45 mm at 0.2 mm layers and a flow of 1.3 is an offset of 0.061.
-        assert!(out.contains("G1 X9.939 Y0.061"), "{out}");
-    }
-
-    /// Asking for no extra flow asks for no compensation either.
-    #[test]
-    fn a_multiplier_of_one_leaves_the_visible_wall_where_it_was() {
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0),
-            skin()
-        )));
-        let out = run(&source, &plain());
-        assert!(out.contains("G1 X10.00 Y0.00 E1 ; skin1"), "{out}");
-    }
-
-    /// The visible wall takes its place in the alternation instead of being
-    /// held out of it. Three walls leave both ends of the stack flat and raise
-    /// the one between them; four raise the far end, so a wall exposed on both
-    /// faces has one of them raised whenever the count is even.
-    #[test]
-    fn the_visible_wall_anchors_an_alternation_that_runs_the_whole_stack() {
-        let stack = |walls: usize| {
-            let mut body = String::from(";TYPE:Perimeter\n");
-            for wall in (1..walls).rev() {
-                body.push_str(&wall_of(
-                    1,
-                    &format!("in{wall}"),
-                    0.45 * wall as f64,
-                    10.0 - 0.9 * wall as f64,
-                    1.0,
-                ));
-            }
-            body.push_str(";TYPE:External perimeter\n");
-            body.push_str(&wall_of(1, "skin", 0.0, 10.0, 1.0));
-            let out = run(&middle_layer(&body), &plain());
-            loop_states(&out)
-        };
-
-        assert_eq!(
-            stack(3),
-            vec![
-                ("in21".to_owned(), false),
-                ("in11".to_owned(), true),
-                ("skin1".to_owned(), false),
-            ],
-            "three walls: only the one between the ends"
-        );
-        assert_eq!(
-            stack(4),
-            vec![
-                ("in31".to_owned(), true),
-                ("in21".to_owned(), false),
-                ("in11".to_owned(), true),
-                ("skin1".to_owned(), false),
-            ],
-            "four walls: the far end is raised too"
-        );
-    }
-
-    /// A wall printed `inner-outer-inner` puts the visible wall between the
-    /// two halves of the stack, so a loop's place in the buffer is no longer
-    /// its place in the wall: the innermost loop is printed immediately after
-    /// the visible one while sitting a whole stack away from it. Numbering by
-    /// buffer position leaves it and its neighbour on the same level, which is
-    /// the one thing bricking exists to prevent.
-    #[test]
-    fn a_wall_printed_inner_outer_inner_still_alternates_by_geometry() {
-        let ring = |wall: usize, tag: &str| {
-            wall_of(1, tag, 0.45 * wall as f64, 10.0 - 0.9 * wall as f64, 1.0)
-        };
-        // Four walls, the visible one third out of the nozzle.
-        let body = format!(
-            ";TYPE:Perimeter\n{}{}\
-             ;TYPE:External perimeter\n{}\
-             ;TYPE:Perimeter\n{}",
-            ring(2, "in2"),
-            ring(1, "in1"),
-            ring(0, "skin"),
-            ring(3, "in3"),
-        );
-        let states = loop_states(&run(&middle_layer(&body), &plain()));
-
-        assert_eq!(
-            states,
-            vec![
-                ("in21".to_owned(), false),
-                ("in11".to_owned(), true),
-                ("skin1".to_owned(), false),
-                ("in31".to_owned(), true),
-            ],
-            "reading outwards that is skin flat, in1 raised, in2 flat, in3 raised"
-        );
-    }
-
-    /// The loop printed after the visible wall in `inner-outer-inner` is the
-    /// innermost one, which on a thick wall runs further from it than any two
-    /// neighbours ever do. Grouping only against the loop printed before would
-    /// split it off into a contour of its own and number it from scratch.
-    #[test]
-    fn a_thick_wall_stays_one_contour_however_its_loops_were_sequenced() {
-        let ring = |wall: usize, tag: &str| {
-            wall_of(1, tag, 0.45 * wall as f64, 12.0 - 0.9 * wall as f64, 1.0)
-        };
-        let mut body = String::from(";TYPE:Perimeter\n");
-        for wall in [4usize, 3, 2, 1] {
-            body.push_str(&ring(wall, &format!("in{wall}")));
-        }
-        body.push_str(";TYPE:External perimeter\n");
-        body.push_str(&ring(0, "skin"));
-        body.push_str(";TYPE:Perimeter\n");
-        // 2.25 mm from the visible wall, well past `MAX_LOOP_GAP`.
-        body.push_str(&ring(5, "in5"));
-        let states = loop_states(&run(&middle_layer(&body), &plain()));
-
-        assert_eq!(
-            states,
-            vec![
-                ("in41".to_owned(), false),
-                ("in31".to_owned(), true),
-                ("in21".to_owned(), false),
-                ("in11".to_owned(), true),
-                ("skin1".to_owned(), false),
-                ("in51".to_owned(), true),
-            ],
-            "the innermost loop belongs to the wall, not to a contour of its own"
-        );
-    }
-
-    /// One wall shows one visible loop, so a second one is a second wall
-    /// however close it runs. Grouping purely by "runs beside anything already
-    /// in this contour" chains a part's islands together as each joined loop
-    /// widens the contour's reach: measured on a 2-wall Benchy, 61 contours
-    /// held two walls and one held nine, and every wall after the first was
-    /// numbered from the first wall's visible loop.
-    #[test]
-    fn each_visible_wall_opens_a_contour_of_its_own() {
-        // Three islands a millimetre apart, closer than two loops of one wall.
-        let mut body = String::new();
-        for (island, origin) in [(1, 0.0), (2, 11.0), (3, 22.0)] {
-            body.push_str(";TYPE:Perimeter\n");
-            body.push_str(&wall_of(1, &format!("in{island}"), origin + 0.45, 9.1, 1.0));
-            body.push_str(";TYPE:External perimeter\n");
-            body.push_str(&wall_of(1, &format!("out{island}"), origin, 10.0, 1.0));
-        }
-        let states = loop_states(&run(&middle_layer(&body), &plain()));
-
-        assert_eq!(
-            states,
-            vec![
-                ("in11".to_owned(), true),
-                ("out11".to_owned(), false),
-                ("in21".to_owned(), true),
-                ("out21".to_owned(), false),
-                ("in31".to_owned(), true),
-                ("out31".to_owned(), false),
-            ],
-            "every island must be numbered from its own visible wall"
-        );
-    }
-
-    /// An arc moves with the rest of the loop: it keeps the centre it was
-    /// drawn about, its radius changes by the offset, and the `I`/`J` that
-    /// name the centre from its start point are restated because that start
-    /// point moved. Without the restatement the printer sweeps the old centre
-    /// and the bead spirals away from the loop it belongs to.
-    #[test]
-    fn a_visible_wall_drawn_with_an_arc_moves_with_its_centre() {
-        let arc = ";TYPE:External perimeter\n\
-             G1 X0.00 Y0.00 F9000\n\
-             G1 X10.00 Y0.00 E1.0 ; arcskin\n\
-             G2 X10.00 Y10.00 I0 J5 E1.0\n\
-             G1 X0.00 Y10.00 E1.0\n\
-             G1 X0.00 Y0.00 E1.0\n";
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{arc}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0)
-        )));
-        let out = run(&source, &drawn_in());
-        // The arc turns clockwise, so the material is on the far side of its
-        // centre and the offset takes the radius from 5 out to 5.054.
-        assert!(
-            out.contains("G2 X10.000 Y10.054 I0.000 J5.054"),
-            "the arc must be redrawn about the centre it kept: {out}"
-        );
-        // Start (10.000, -0.054) plus J puts the centre back at (10, 5).
-        assert!(
-            out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
-            "{out}"
-        );
-    }
-
-    /// An open fragment has no inside, so there is no direction to move it in.
-    #[test]
-    fn an_open_run_of_visible_wall_is_not_moved() {
-        let open = ";TYPE:External perimeter\n\
-             G1 X0.00 Y0.00 F9000\n\
-             G1 X10.00 Y0.00 E1.0 ; open\n\
-             G1 X10.00 Y10.00 E1.0\n";
-        let source = with_skin_width(&middle_layer(&format!(
-            ";TYPE:Perimeter\n{}{open}",
-            wall_of(1, "loop", 0.6, 8.8, 1.0)
-        )));
-        let out = run(&source, &drawn_in());
-        assert!(out.contains("G1 X10.00 Y0.00 E1.30000 ; open"), "{out}");
-    }
-
-    /// The half layer a column is displaced by is paid over two layers rather
-    /// than in one bead, and given back in one when the column is capped.
-    #[test]
-    fn a_column_climbs_to_its_offset_instead_of_jumping() {
-        let mut source = String::from("; layer_height = 0.2\nM83\n");
-        for index in 0..5 {
-            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
-            source.push_str(";TYPE:Perimeter\n");
-            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
-        }
-        let out = run(&source, &plain());
-        let flow = |tag: &str| {
-            out.lines()
-                .find(|line| line.ends_with(tag))
-                .map(|line| Line::parse(line).e.expect("an extrusion"))
-                .unwrap_or_else(|| panic!("{tag} missing from:\n{out}"))
-        };
-        // Flat on the bed, a quarter of a layer taller on each of the two
-        // climbing layers, as sliced once the column is up, and half a layer
-        // short where the cap gives the climb back.
-        assert_eq!(flow("L0loop2"), 1.0, "bed layer");
-        assert_eq!(flow("L1loop2"), 1.25, "first climb");
-        assert_eq!(flow("L2loop2"), 1.25, "second climb");
-        assert_eq!(flow("L3loop2"), 1.0, "column up");
-        assert_eq!(flow("L4loop2"), 0.5, "cap");
-        assert!(
-            out.contains("Z0.450 ; bricklayers brick raised"),
-            "half the shift on the first climb:\n{out}"
-        );
-        assert!(
-            out.contains("Z0.700 ; bricklayers brick raised"),
-            "full shift on the second:\n{out}"
-        );
-    }
-
-    /// A bead on the bed is pressed against the build plate rather than
-    /// against a layer, so raising it presses nothing and the extra flow it
-    /// would need spreads sideways. There is no seam under it to stagger
-    /// either. On a Benchy this filled in the bottom nameplate, which is one
-    /// layer deep.
-    #[test]
-    fn the_layer_laid_on_the_bed_is_never_raised() {
-        let mut source = String::from("; layer_height = 0.2\nM83\n");
-        for index in 0..4 {
-            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
-            source.push_str(";TYPE:Perimeter\n");
-            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
-        }
-        let outcome = apply(&source, &Config::default());
-        let bed: Vec<&str> = outcome
-            .gcode
-            .lines()
-            .take_while(|line| !line.contains("L1loop"))
-            .collect();
-        assert!(
-            !bed.iter().any(|line| line.contains("raised")),
-            "nothing may be raised on the bed layer:\n{}",
-            bed.join("\n")
-        );
-        assert!(
-            bed.iter().all(|line| !line.contains("E1.5")),
-            "nor over-extruded:\n{}",
-            bed.join("\n")
-        );
-    }
-
-    /// The cap gives back exactly what the column climbed, which is less than
-    /// half a layer when the wall ended before it finished climbing.
-    #[test]
-    fn a_cap_gives_back_only_the_climb_the_column_took() {
-        let mut source = String::from("; layer_height = 0.2\nM83\n");
-        for index in 0..3 {
-            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
-            source.push_str(";TYPE:Perimeter\n");
-            source.push_str(&wall_of(2, &format!("L{index}loop"), 0.0, 10.0, 1.0));
-        }
-        let out = run(&source, &plain());
-        let flow = |tag: &str| {
-            out.lines()
-                .find(|line| line.ends_with(tag))
-                .map(|line| Line::parse(line).e.expect("an extrusion"))
-                .unwrap_or_else(|| panic!("{tag} missing from:\n{out}"))
-        };
-        assert_eq!(flow("L1loop2"), 1.25, "climbed a quarter of a layer");
-        assert_eq!(flow("L2loop2"), 0.75, "so the cap gives a quarter back");
-    }
-
-    /// A wall that stands for two layers never climbs, so it is left exactly
-    /// as the slicer wrote it. Embossed text and other one- or two-layer
-    /// detail lands here.
-    #[test]
-    fn a_wall_too_short_to_climb_is_left_alone() {
-        let wall = format!(";TYPE:Perimeter\n{}", wall_of(2, "loop", 0.0, 10.0, 1.0));
-        let source = relative(&format!("{}{wall}{}{wall}", layer(0.2), layer(0.4)));
-        let out = run(&source, &Config::default());
-        assert!(!out.contains("raised"), "{out}");
-        assert!(!out.contains("E1.25000"), "{out}");
-    }
-
-    /// A file whose slicer varied the layer height, with `body` on a layer
-    /// half as deep as the rest of them.
-    ///
-    /// The layer under test runs 0.6 to 0.7 while every other one is 0.2, so a
-    /// raise taken from its own height cannot be confused with one taken from
-    /// the 0.2 the file declares. It sits three layers above the bed, clear of
-    /// the [`RAMP`], and carries a wall above it for the reason
-    /// [`middle_layer`] does.
-    fn varied_layers(body: &str) -> String {
-        let same = untagged(body);
-        let wall = ";TYPE:Perimeter\n\
-             G1 X0 Y0 F9000\n\
-             G1 X10 Y0 E0.5\n\
-             G1 X10 Y10 E0.5\n\
-             G1 X0 Y10 E0.5\n\
-             G1 X0 Y0 E0.5\n";
-        relative(&format!(
-            "{}{wall}{}{same}{}{same}{}{body}{}{wall}",
-            layer(0.2),
-            layer(0.4),
-            layer(0.6),
-            layer(0.7),
-            layer(0.9),
-        ))
-    }
-
-    /// Half of one layer height for the whole file staggers every layer that
-    /// is not that height by the wrong amount, and an adaptive slice has
-    /// almost none that are. Measured on a real Benchy sliced adaptively: the
-    /// layers ran 0.081 to 0.119 mm against a declared 0.2, so 383 of 511 were
-    /// lifted further than their own height and stood clear of the layer above
-    /// with a gap underneath.
-    #[test]
-    fn a_raise_is_half_of_the_layer_it_belongs_to() {
-        let source = varied_layers(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
-        let out = run(&source, &Config::default());
-        assert!(
-            out.contains("Z0.750 ; bricklayers brick raised"),
-            "the layer is 0.1 deep, so it takes 0.05:\n{out}"
-        );
-        assert!(
-            !out.contains("Z0.800 ; bricklayers brick raised"),
-            "half the declared 0.2 is a whole layer here:\n{out}"
-        );
-    }
-
-    /// A raised bead starts on top of whatever its own column left on the
-    /// layer below, so where the layer thins the column has already filled
-    /// part of it and the bead is metered for the gap that is left.
-    #[test]
-    fn a_bead_is_metered_for_the_gap_its_own_column_left() {
-        let source = varied_layers(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
-        let out = run(&source, &plain());
-        let raised = out
-            .lines()
-            .find(|line| line.ends_with("loop2"))
-            .map(|line| Line::parse(line).e.expect("an extrusion"))
-            .unwrap_or_else(|| panic!("loop2 missing from:\n{out}"));
-        // The column below stands 0.1 above the 0.6 plane and the nozzle is at
-        // 0.75, so the bead spans 0.05 of a layer metered for 0.1.
-        assert_eq!(raised, 0.25, "half the flow of a 0.5 bead:\n{out}");
-    }
-
-    /// The region buffer and the loop list are reused between regions, so a
-    /// second wall in the same layer has to be grouped and numbered from
-    /// scratch rather than from whatever the first left.
-    #[test]
-    fn a_second_region_in_a_layer_is_grouped_on_its_own() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n{}\
-             ;TYPE:External perimeter\nG1 X0 Y0 F9000\nG1 X10 Y0 E0.5\n\
-             ;TYPE:Perimeter\n{}",
-            wall_of(2, "near", 0.0, 10.0, 0.5),
-            wall_of(3, "far", 40.0, 10.0, 0.5),
-        ));
-        let out = run(&source, &Config::default());
-
-        // Numbering runs outwards from the loop against the visible wall,
-        // which each slicer prints last, so the raise alternates from there.
-        assert_eq!(
-            loop_states(&out),
-            [
-                ("near1".to_owned(), false),
-                ("near2".to_owned(), true),
-                ("far1".to_owned(), true),
-                ("far2".to_owned(), false),
-                ("far3".to_owned(), true),
-            ],
-            "{out}"
-        );
-    }
-
-    /// Slicers scatter their own annotations through a wall. They are not
-    /// region markers, so they must neither end the region nor be dropped.
-    #[test]
-    fn a_slicer_annotation_inside_a_wall_is_replayed_in_place() {
-        let source = middle_layer(&format!(
-            ";TYPE:Perimeter\n; LINE_WIDTH: 0.42\n{}",
-            wall(2, "loop")
-        ));
-        let out = run(&source, &Config::default());
-
-        assert!(
-            out.contains("; LINE_WIDTH: 0.42"),
-            "annotation kept:\n{out}"
-        );
-        assert_eq!(
-            loop_states(&out)
-                .into_iter()
-                .filter(|(tag, _)| tag.starts_with("loop"))
-                .collect::<Vec<_>>(),
-            [("loop1".to_owned(), false), ("loop2".to_owned(), true)],
-            "the annotation must not split the wall:\n{out}"
-        );
-    }
-
-    #[test]
-    fn absolute_extrusion_stays_continuous() {
-        let body = ";TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E{a} ; loop1\n\
-             G1 X9.55 Y9.55 E{b}\n\
-             G1 X0.45 Y9.55 E{c}\n\
-             G1 X0.45 Y0.45 E{d}\n\
-             G1 X0 Y0 F9000\n\
-             G1 X10 Y0 E{e} ; loop2\n\
-             G1 X10 Y10 E{f}\n\
-             G1 X0 Y10 E{g}\n\
-             G1 X0 Y0 E{h}\n";
-        // One absolute stream climbing by 1 mm a move, over a wall that runs
-        // the height of the file so the layer under test is neither where its
-        // column starts nor where it ends.
-        let mut source = String::from("; layer_height = 0.2\nM82\n");
-        let mut e = 0.0;
-        let next = |e: &mut f64| {
-            let mut text = body.to_string();
-            for key in ["{a}", "{b}", "{c}", "{d}", "{e}", "{f}", "{g}", "{h}"] {
-                *e += 1.0;
-                text = text.replacen(key, &format!("{e:.1}"), 1);
-            }
-            text
-        };
-        // Only the layer under test keeps its tags, so the copies that give
-        // its column something to stand on cannot be matched instead.
-        for z in [0.2, 0.4, 0.6, 0.8] {
-            source.push_str(&layer(z));
-            source.push_str(&untagged(&next(&mut e)));
-        }
-        source.push_str(&layer(1.0));
-        source.push_str(&next(&mut e));
-        e += 1.0;
-        source.push_str(&format!(";TYPE:Solid infill\nG1 X30 Y0 E{e:.1}\n"));
-        source.push_str(&layer(1.2));
-        source.push_str(&untagged(&next(&mut e)));
-
-        let config = Config {
-            wall_flow: Some(2.0),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-
-        // Read the stream back as per-move deltas, which is what the machine
-        // acts on and what has to stay right however much the rescale shifted
-        // the absolute values.
-        let mut last = 0.0;
-        let mut moves = Vec::new();
-        for line in out.lines() {
-            let parsed = Line::parse(line);
-            if !parsed.draws() {
-                continue;
-            }
-            if let Some(value) = parsed.e {
-                moves.push((line.to_owned(), value - last));
-                last = value;
-            }
-        }
-        assert!(
-            moves.iter().all(|(_, delta)| *delta > 0.0),
-            "the extruder never runs backwards: {out}"
-        );
-        let delta = |tag: &str| {
-            moves
-                .iter()
-                .find(|(line, _)| line.ends_with(tag))
-                .map(|(_, delta)| *delta)
-                .unwrap_or_else(|| panic!("{tag} missing from:\n{out}"))
-        };
-        assert_eq!(delta("; loop1"), 2.0, "the loop on the plane is doubled");
-        assert_eq!(delta("; loop2"), 2.0, "and so is the raised one");
-        assert!(
-            out.contains("G1 X30 Y0 E"),
-            "the infill after it is kept: {out}"
-        );
-    }
-
-    /// Whether a line has to be written again is whether the value it should
-    /// carry differs from the one it already has. Asking a global drift flag
-    /// instead is wrong inside a buffered region: the region is read to its
-    /// end before any of it is emitted, so the input position sits ahead of
-    /// the output and the two coincide by accident every so often. The line
-    /// where they met came out carrying its original, now stale, absolute
-    /// value — on a Cura-flavoured file the extruder ran 0.6 mm backwards
-    /// mid-wall and then asked for a double-length move to catch up.
-    #[test]
-    fn an_absolute_stream_never_runs_backwards() {
-        // The first layer's raised bead is metered thicker, which shifts every
-        // value after it and sets up the coincidence.
-        let mut source = String::from("; layer_height = 0.2\nM82\nG92 E0\n");
-        let mut e = 0.0;
-        for index in 0..6 {
-            source.push_str(&layer(0.2 + f64::from(index) * 0.2));
-            source.push_str(";TYPE:Perimeter\n");
-            for inset in [0.9_f64, 0.45] {
-                source.push_str(&format!("G1 X{inset:.2} Y{inset:.2} F9000\n"));
-                let far = 20.0 - inset;
-                for (x, y) in [(far, inset), (far, far), (inset, far), (inset, inset)] {
-                    e += 0.6;
-                    source.push_str(&format!("G1 X{x:.3} Y{y:.3} E{e:.5}\n"));
-                }
-            }
-            source.push_str(";TYPE:Solid infill\nG1 X2 Y2 F9000\n");
-            e += 1.2;
-            source.push_str(&format!("G1 X18 Y18 E{e:.5}\n"));
-        }
-        let out = run(&source, &Config::default());
-
-        let mut position = 0.0;
-        let mut moves = 0;
-        for line in out.lines() {
-            let parsed = Line::parse(line);
-            let Some(value) = parsed.e.filter(|_| parsed.draws()) else {
-                continue;
-            };
-            moves += 1;
-            assert!(
-                value >= position,
-                "{line} pulls the filament back from {position}:\n{out}"
-            );
-            assert!(
-                value - position <= 1.5,
-                "{line} asks for {} mm in one move:\n{out}",
-                value - position
-            );
-            position = value;
-        }
-        assert!(moves > 50, "expected the whole file to be checked");
-    }
-
-    #[test]
-    fn numbering_follows_the_wall_order_the_slicer_used() {
-        // Printed the other way round, the loop against the visible wall is
-        // the first one out of the nozzle rather than the last.
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
-        let config = Config {
-            external_perimeters_first: true,
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        assert_eq!(
-            loop_states(&out),
-            vec![("loop1".to_owned(), true), ("loop2".to_owned(), false)],
-            "{out}"
-        );
-    }
-
-    /// A layer height that is not a length would become half a shift and drive
-    /// the nozzle down into the layer below, or write `ZNaN` into the file.
-    /// Every source of one is filtered, this included.
-    #[test]
-    fn a_layer_height_that_is_not_a_length_is_ignored() {
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
-        let sane = run(&source, &Config::default());
-
-        for height in [0.0, -0.4, f64::NAN, f64::INFINITY] {
-            let config = Config {
-                layer_height: Some(height),
-                ..Config::default()
-            };
-            let outcome = apply(&source, &config);
-            assert_eq!(
-                outcome.gcode, sane,
-                "--layer-height {height} should fall back to the file's own"
-            );
-            for line in outcome.gcode.lines() {
-                if let Some(z) = Line::parse(line).z {
-                    assert!(z.is_finite() && z >= 0.0, "{line}");
-                }
-            }
-        }
-    }
-
-    /// Cura resets the extruder origin periodically to keep `E` from growing
-    /// without bound, and the reset can land inside a wall. The region's own
-    /// moves have not been metered out when it arrives, so replaying them
-    /// after it measured their absolute positions from the wrong zero: the
-    /// first move after `G92 E0` asked for 2.5 mm of filament in one go.
-    #[test]
-    fn a_g92_inside_a_wall_keeps_the_absolute_stream_honest() {
-        let source = format!(
-            "; layer_height = 0.2\nM82\n{}{}{};TYPE:Perimeter\n\
-             G1 X0.45 Y0.45 F9000\n\
-             G1 X9.55 Y0.45 E1.0\n\
-             G1 X9.55 Y9.55 E2.0\n\
-             G92 E0\n\
-             G1 X0 Y0 F9000\n\
-             G1 X10 Y0 E1.0\n\
-             G1 X10 Y10 E2.0\n",
-            layer(0.2),
-            layer(0.4),
-            layer(0.6),
-        );
-        let config = Config {
-            wall_flow: Some(1.3),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-
-        // The origin line is not an extrusion and must survive untouched.
-        assert!(out.contains("\nG92 E0\n"), "{out}");
-
-        // Every absolute value after the reset is measured from the new zero,
-        // so none of them may jump.
-        let after = out.split("\nG92 E0\n").nth(1).expect("the reset is kept");
-        let mut position = 0.0;
-        for line in after.lines() {
-            let parsed = Line::parse(line);
-            if !parsed.draws() {
-                continue;
-            }
-            if let Some(e) = parsed.e {
-                assert!(
-                    e >= position && e - position <= 2.0,
-                    "{line} asks for {} mm in one move:\n{out}",
-                    e - position
-                );
-                position = e;
-            }
-        }
-    }
-
-    /// A file sliced to complete individual objects builds each one from the
-    /// bed up, so it holds several first and last layers rather than one pair.
-    /// Metering only the file's own leaves every later object's bed layer
-    /// starved and bricks the top of every object but the last.
-    #[test]
-    fn every_object_gets_its_own_first_and_last_layer() {
-        let mut source = String::from("; layer_height = 0.2\nM83\n");
-        for object in 1..=2 {
-            for index in 0..4 {
-                source.push_str(&layer(0.2 + f64::from(index) * 0.2));
-                source.push_str(";TYPE:Perimeter\n");
-                source.push_str(&wall_of(
-                    2,
-                    &format!("o{object}L{index}loop"),
-                    0.0,
-                    10.0,
-                    0.5,
-                ));
-            }
-        }
-        let out = run(&source, &plain());
-
-        // A column climbs over the two layers above the bed and gives the
-        // climb back where it is capped, and it does that once per object
-        // rather than once per file.
-        let flow = |tag: &str| {
-            out.lines()
-                .find(|line| line.ends_with(tag))
-                .map(|line| Line::parse(line).e.expect("an extrusion"))
-                .unwrap_or_else(|| panic!("{tag} missing from:\n{out}"))
-        };
-        for object in 1..=2 {
-            assert_eq!(
-                flow(&format!("o{object}L0loop2")),
-                0.5,
-                "object {object} bed layer"
-            );
-            assert_eq!(
-                flow(&format!("o{object}L1loop2")),
-                0.625,
-                "object {object} first climb"
-            );
-            assert_eq!(
-                flow(&format!("o{object}L2loop2")),
-                0.625,
-                "object {object} second climb"
-            );
-            assert_eq!(
-                flow(&format!("o{object}L3loop2")),
-                0.25,
-                "object {object} top layer"
-            );
-        }
-    }
-
-    #[test]
-    fn g92_resets_the_extrusion_offset() {
-        let source = format!(
-            "M82\n{};TYPE:Perimeter\nG1 X10 Y0 E1.0\n;TYPE:Solid infill\nG92 E0\nG1 X20 Y0 E1.0\n",
-            layer(0.2),
-        );
-        let config = Config {
-            wall_flow: Some(2.0),
-            ..Config::default()
-        };
-        let out = run(&source, &config);
-        assert!(out.contains("G1 X20 Y0 E1.0\n"), "{out}");
-    }
-
-    #[test]
-    fn gcode_without_perimeters_is_unchanged() {
-        let source = "M83\nG1 Z0.2\nG1 X1 Y1 E0.1\nM104 S0\n";
-        assert_eq!(run(source, &Config::default()), source);
-    }
-
-    #[test]
-    fn empty_input_produces_empty_output() {
-        assert_eq!(run("", &Config::default()), "");
-    }
-
-    #[test]
-    fn reports_what_it_did() {
-        let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
-        let stats = apply(&source, &Config::default()).stats;
-        assert_eq!(stats.loops, 10);
-        assert_eq!(stats.raised, 3);
-        assert_eq!(stats.layers, 5);
-        assert_eq!(stats.layer_height, 0.2);
-        assert!(stats.layer_height_detected);
+/// The `M82`/`M83` that puts the extruder in the convention `absolute` names.
+fn e_mode(absolute: bool) -> Code {
+    if absolute {
+        Code::AbsoluteE
+    } else {
+        Code::RelativeE
     }
 }
+
+#[cfg(test)]
+mod tests;

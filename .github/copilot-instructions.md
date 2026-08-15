@@ -382,6 +382,28 @@ in the way.
   window. Byte-identical output on six real slices, and it took the test suite
   from ~9 minutes to 55 seconds — `binary_gcode.rs` alone went from 480 s to
   4.1 s, because its 2000-layer column is nothing else.
+- **A cell no flood fill can reach is NOT a cell with nothing in it, and `mouths`
+  is the one place that mattered.** `mark` paints a path of bead CENTRES one cell
+  wide while the plastic reaches half a bead either side, so in a solid region
+  every pair of neighbouring lines leaves a speck of "hollow" between them. A
+  speck passes the pocket/nesting/slack tests trivially and its carry then runs
+  the whole sparse interior of the part: measured on a user's 672-layer part,
+  **2878 pockets accepted, median ONE cell across, carrying a median of 1301
+  rings — 25.6 million cells of the layers above carved out of 66 thousand cells
+  of pocket.** `is_open` then said true all through the inside of the object, so
+  `zaa` followed walls buried in there, raised them, and the next layer printed
+  on top; `--zaa` re-metered that file by **+14.34%** where a followed surface
+  gives back what it takes and comes out near zero. `waist` (a pocket must be a
+  whole bead across in both axes) and `tread` (the carry may not outrun
+  `carried`, past which `fading` is zero anyway) are the two bounds, and both are
+  the module's own arithmetic. Afterwards: 272 moves on 27 layers at **-0.67%**,
+  against 261 on 24 with `mouths` off entirely — so real mouths survive. Do NOT
+  relax either bound to "keep more surface": a Benchy went +12.47% to +4.32% and
+  an 18 MB duct went from 4213 followed moves to NOTHING, and every mouth the
+  duct had was a crack two or three cells wide. Pinned by
+  `surface::tests::a_gap_between_two_beads_is_not_a_hole_that_opens_upward` and
+  `surface::tests::a_pocket_loose_in_a_void_is_not_a_lip_over_a_hole`, both of
+  which check the accepting half too.
 - **A surface is only ever reshaped where nothing is printed over it, and a wall
   only where it stands on its own plane.** `Field::is_open` and
   `zaa::Pass::reshapes` are the two guards, and both are load-bearing. The

@@ -367,12 +367,29 @@ impl Builder {
         // told apart every one of them reads as covered. Both pairs of
         // layers, so a countersink's tread is measured against the bore it
         // stands on as well as against the one above it.
+        let cell = grid.cell();
+        // The widest strip carried at all. Everything up to the reach is
+        // followed at full amplitude, because that is the only amplitude at
+        // which one layer's ramp meets the next one's, and the quarter past
+        // it is where the amplitude tapers away instead — see [`FADE`].
+        let carried = reach * (1.0 + FADE);
+        // An upward-facing surface around a hole is a pocket this layer
+        // encloses and the layer above opens wider, and until the two are
+        // told apart every one of them reads as covered. Both pairs of
+        // layers, so a countersink's tread is measured against the bore it
+        // stands on as well as against the one above it.
         {
+            // A hole is at least a bead across and its tread is at most the
+            // widest strip followed, both stated in cells. Where the file
+            // named no bead width the grid answers instead: [`MOUTH_SLACK`]
+            // is already the narrowest feature it can express.
+            let waist = cells_of(bead * 2.0, cell).max(MOUTH_SLACK);
+            let tread = cells_of(carried, cell);
             let [own, over, under] = &mut self.inside;
             let (own, over, under) = (&mut own[..], &mut over[..], &mut under[..]);
             let (marks, stack, spans) = (&mut self.marks, &mut self.stack, &mut self.spans);
-            mouths(own, over, marks, stack, spans, width, height);
-            mouths(under, own, marks, stack, spans, width, height);
+            mouths(own, over, marks, stack, spans, width, height, waist, tread);
+            mouths(under, own, marks, stack, spans, width, height, waist, tread);
         }
         // Distance from a point of the strip to the outside of its own layer,
         // to the layer printed over it, and to the outside of the layer it
@@ -414,7 +431,6 @@ impl Builder {
         self.rough[..cells].fill(0.0);
         self.live[..height].fill(false);
 
-        let cell = grid.cell();
         let mm = |value: u16| match value {
             UNREACHED => f64::INFINITY,
             value => f64::from(value) / SPAN * cell,
@@ -433,11 +449,6 @@ impl Builder {
         // should already be, and without this it would be taken down a whole
         // half layer onto the one below.
         let shift = bead.max(0.0);
-        // The widest strip carried at all. Everything up to the reach is
-        // followed at full amplitude, because that is the only amplitude at
-        // which one layer's ramp meets the next one's, and the quarter past
-        // it is where the amplitude tapers away instead — see [`FADE`].
-        let carried = reach * (1.0 + FADE);
         // The chamfer distance a strip of `carried` works out to, so the two
         // legs that make one up can be compared as integers and most of the
         // window answered before any of the arithmetic below. A strip at or
@@ -848,6 +859,21 @@ const FORWARD: [(isize, isize, u16); 8] = [
 /// the bore's own wall as the edge of the layer: the tread's low end is then
 /// this layer's outline and its high end the layer above's, which is the same
 /// climb as on any other slope, only facing inward.
+///
+/// `waist` and `tread` are what keep the three tests above honest on a real
+/// slice, and both are the module's own arithmetic rather than a tolerance.
+/// A pocket narrower than `waist` — one whole bead, in cells — is the gap the
+/// rasterised centrelines left between two neighbouring beads and not a hole
+/// at all, and a carry running further than `tread` — the widest strip the
+/// transform follows, in cells — is a pocket sitting loose in a void rather
+/// than a lip over a hole. Without them, measured on a 672-layer part sliced
+/// at 15% gyroid with 0.42 mm beads: **2878 pockets accepted, half of them a
+/// single cell across, carrying a median of 1301 rings** — 190 mm of claimed
+/// tread — so 25.6 million cells of the layers above were carved out of
+/// 66 thousand cells of pocket, the interior of the part read as an open
+/// surface, and the walls buried inside it were followed and then printed
+/// over. That is what `--zaa` re-metering a file by **+14.34%** looks like,
+/// against the −0.71% the same file gives once a mouth has to be one.
 #[allow(clippy::too_many_arguments)]
 fn mouths(
     lower: &mut [u8],
@@ -857,6 +883,8 @@ fn mouths(
     spans: &mut Vec<[u32; 3]>,
     width: usize,
     height: usize,
+    waist: usize,
+    tread: usize,
 ) {
     // Four marks, not one. A pocket already walked is remembered for good, so
     // no pocket is walked twice; the marks the walk through `upper` leaves are
@@ -917,6 +945,8 @@ fn mouths(
         stack.clear();
         spans.clear();
         let (mut held, mut surrounded) = (true, true);
+        let mut across = 0usize;
+        let (mut lowest, mut highest) = (usize::MAX, 0usize);
         fill(
             lower,
             upper,
@@ -929,6 +959,9 @@ fn mouths(
             &mut surrounded,
         );
         while let Some([row, from, to]) = spans.pop() {
+            across = across.max((to - from + 1) as usize);
+            lowest = lowest.min(row as usize);
+            highest = highest.max(row as usize);
             let (from, to) = (from as usize, to as usize);
             for base in [(row as usize - 1) * width, (row as usize + 1) * width] {
                 let mut x = from;
@@ -954,11 +987,33 @@ fn mouths(
             }
         }
         let pocket = stack.len();
+        // `fill` pushed a span before the walk began and every span is popped,
+        // so the two always hold a real row.
+        let rows = highest + 1 - lowest.min(highest);
+        // A gap narrower than the bead that drew the outline is not a void.
+        // What is painted here is a path of bead *centres*, so material
+        // reaches half a bead either side of every cell marked, and the cells
+        // left clear between two neighbouring beads are inside the plastic
+        // rather than inside a hole. Measured on a 672-layer part sliced with
+        // 0.42 mm beads: of the 2878 pockets this accepted, half were **one
+        // cell** across and 97% were under three, every one of them the gap
+        // between two lines of a solid region.
+        let hole = across >= waist && rows >= waist;
 
         // How far `upper` carries the same pocket past this one, a ring of
         // cells at a time. The first ring is this layer's own wall.
+        //
+        // The walk is stopped, and the pocket refused with it, once it has run
+        // further than the widest strip the transform follows: a tread that
+        // wide is not a lip over a hole, it is the pocket sitting loose inside
+        // a void of `upper`, and carving that void reads a strip where the
+        // part has none. Nothing is given up by the bound — past `carried` a
+        // strip's `fading` is zero, so no cell out there could move a bead
+        // anyway. On the same file the pockets accepted ran a median of 1301
+        // rings, 190 mm of "tread", into the sparse-infill interior.
         let mut rings = 0;
-        if held && surrounded {
+        let mut escaped = false;
+        if held && surrounded && hole {
             let mut edge = pocket;
             let mut cursor = 0;
             while cursor < edge {
@@ -979,10 +1034,14 @@ fn mouths(
                 }
                 rings += usize::from(stack.len() > edge);
                 edge = stack.len();
+                if rings > tread {
+                    escaped = true;
+                    break;
+                }
             }
         }
 
-        if rings >= MOUTH_SLACK {
+        if rings >= MOUTH_SLACK && !escaped {
             for &at in &stack[..pocket] {
                 lower[at as usize] = MOUTH;
             }
@@ -1050,6 +1109,18 @@ fn fill(
 fn grow<T: Clone>(buffer: &mut Vec<T>, cells: usize, value: T) {
     if buffer.len() < cells {
         buffer.resize(cells, value);
+    }
+}
+
+/// A length in millimetres as a whole number of cells, rounded up, and never
+/// wider than a window may be. A length the file never stated arrives here as
+/// zero or as something not finite, and answers zero, which every caller
+/// reads as "the grid decides".
+fn cells_of(length: f64, cell: f64) -> usize {
+    let cells = (length / cell).ceil();
+    match cells.is_finite() && cells > 0.0 {
+        true => (cells as usize).min(MAX_WINDOW),
+        false => 0,
     }
 }
 
@@ -1610,6 +1681,8 @@ mod tests {
                 &mut Vec::new(),
                 width,
                 height,
+                MOUTH_SLACK,
+                width.max(height),
             );
             lower
         };
@@ -1635,6 +1708,178 @@ mod tests {
         assert!(
             !carved.contains(&MOUTH),
             "a pocket the layer above covers anywhere is not a mouth"
+        );
+    }
+
+    /// Reads an ASCII picture of a layer: `#` is material, `o` is what the
+    /// outline encloses and nothing was printed in, `.` is outside.
+    fn picture(rows: &[&str]) -> Vec<u8> {
+        rows.iter()
+            .flat_map(|row| row.bytes())
+            .map(|cell| match cell {
+                b'#' => MATERIAL,
+                b'o' => HOLLOW,
+                _ => OUTSIDE,
+            })
+            .collect()
+    }
+
+    /// What a run of [`mouths`] made of one layer and the layer above it.
+    fn carved(lower: &[&str], upper: &[&str], waist: usize, tread: usize) -> (Vec<u8>, Vec<u8>) {
+        let width = lower[0].len();
+        let height = lower.len();
+        let (mut lower, mut upper) = (picture(lower), picture(upper));
+        mouths(
+            &mut lower,
+            &mut upper,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            width,
+            height,
+            waist,
+            tread,
+        );
+        (lower, upper)
+    }
+
+    /// What is painted into the window is a path of bead **centres**, so the
+    /// plastic reaches half a bead either side of every cell of it and the
+    /// cells left clear between two neighbouring beads are inside the
+    /// material rather than inside a hole. A flood fill cannot tell the two
+    /// apart, and a speck the size of one cell is the commonest thing in a
+    /// solid region: measured on a 672-layer part, of the 2878 pockets this
+    /// accepted, **half were one cell across** and 97% were under three, and
+    /// between them they carved 25.6 million cells of the layers above out of
+    /// 66 thousand cells of pocket — every wall buried in the interior then
+    /// read as an exposed surface, was followed, and was printed over.
+    #[test]
+    fn a_gap_between_two_beads_is_not_a_hole_that_opens_upward() {
+        // Solid all the way across but for one cell the raster left clear.
+        let speck = [
+            "..............",
+            "..##########..",
+            "..##########..",
+            "..####o#####..",
+            "..##########..",
+            "..##########..",
+            "..##########..",
+            "..##########..",
+            "..............",
+            "..............",
+        ];
+        // Two cells clear, which is a hole this grid can express.
+        let hole = [
+            "..............",
+            "..##########..",
+            "..##########..",
+            "..####oo####..",
+            "..####oo####..",
+            "..##########..",
+            "..##########..",
+            "..##########..",
+            "..............",
+            "..............",
+        ];
+        // The layer above prints nothing over either of them, so both are
+        // nested in a pocket of it and both are carried far past their own.
+        let open = [
+            "..............",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..............",
+            "..............",
+        ];
+        let width = 14;
+
+        let (lower, upper) = carved(&speck, &open, MOUTH_SLACK, width);
+        assert_eq!(
+            lower[3 * width + 6],
+            HOLLOW,
+            "one cell of clearance is not a bore"
+        );
+        assert!(
+            !upper.contains(&MOUTH),
+            "and it must not carve the layer above it"
+        );
+
+        // The same picture with the pocket one cell wider each way is a hole,
+        // so this refuses a width and not a pocket.
+        let (lower, upper) = carved(&hole, &open, MOUTH_SLACK, width);
+        assert_eq!(lower[3 * width + 6], MOUTH, "a bore a bead across is one");
+        assert!(upper.contains(&MOUTH), "and its tread is carved with it");
+    }
+
+    /// A mouth is a lip over a hole, so its tread is a slope like any other
+    /// and cannot be wider than the widest strip this transform follows.
+    /// Where the carry runs past that, what the pocket sits in is not a lip
+    /// but a void — the sparse interior of the part — and carving it reads a
+    /// strip where there is none. Nothing is given up by the bound: out past
+    /// `carried` a strip's `fading` is zero, so no cell there could move a
+    /// bead in any case. Measured on the same 672-layer part, the pockets
+    /// accepted ran a **median of 1301 rings** of claimed tread, 190 mm of
+    /// it, straight across the inside of the object.
+    #[test]
+    fn a_pocket_loose_in_a_void_is_not_a_lip_over_a_hole() {
+        let bore = [
+            "..............",
+            "..##########..",
+            "..##########..",
+            "..###ooo####..",
+            "..###ooo####..",
+            "..###ooo####..",
+            "..##########..",
+            "..##########..",
+            "..............",
+            "..............",
+        ];
+        // A countersink: the same bore one ring wider, and walled beyond it.
+        let lip = [
+            "..............",
+            "..##########..",
+            "..##ooooo###..",
+            "..##ooooo###..",
+            "..##ooooo###..",
+            "..##ooooo###..",
+            "..##ooooo###..",
+            "..##########..",
+            "..............",
+            "..............",
+        ];
+        // The same bore with nothing walling it at all.
+        let void = [
+            "..............",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..oooooooooo..",
+            "..............",
+            "..............",
+        ];
+        let width = 14;
+        let tread = 3;
+
+        let (lower, upper) = carved(&bore, &lip, MOUTH_SLACK, tread);
+        assert_eq!(lower[4 * width + 6], MOUTH, "a tread the lip bounds");
+        assert!(upper.contains(&MOUTH), "and the lip is carved with it");
+
+        let (lower, upper) = carved(&bore, &void, MOUTH_SLACK, tread);
+        assert_eq!(
+            lower[4 * width + 6],
+            HOLLOW,
+            "a carry that runs past the reach is not a tread"
+        );
+        assert!(
+            !upper.contains(&MOUTH),
+            "so nothing of the layer above is carved either"
         );
     }
 

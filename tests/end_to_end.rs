@@ -6,9 +6,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{env, fs};
 
-use bricklayers::brick;
+use corbel::brick;
 
-const BIN: &str = env!("CARGO_BIN_EXE_bricklayers");
+const BIN: &str = env!("CARGO_BIN_EXE_corbel");
 
 /// Three layers of PrusaSlicer-flavoured output: an external perimeter, two
 /// internal perimeter loops and some sparse infill, with solid infill top and
@@ -60,7 +60,7 @@ impl Sandbox {
     fn new(label: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!("bricklayers-{label}-{}-{id}", std::process::id()));
+        let path = env::temp_dir().join(format!("corbel-{label}-{}-{id}", std::process::id()));
         fs::create_dir_all(&path).expect("create sandbox");
         Self(path)
     }
@@ -70,7 +70,11 @@ impl Sandbox {
     }
 
     fn with_bytes(&self, contents: &[u8]) -> PathBuf {
-        let path = self.0.join("part.gcode");
+        self.with_named("part.gcode", contents)
+    }
+
+    fn with_named(&self, name: &str, contents: &[u8]) -> PathBuf {
+        let path = self.0.join(name);
         fs::write(&path, contents).expect("write sample");
         path
     }
@@ -86,15 +90,36 @@ impl Drop for Sandbox {
     }
 }
 
+/// Runs the binary with whichever transforms the arguments name, defaulting to
+/// both.
+///
+/// Naming one is mandatory, and every test here that names neither was written
+/// against a build where naming neither meant both, so that is what it still
+/// means to them. [`run_bare`] is what passes the command line through
+/// untouched, and what checks that a run naming nothing is refused.
 fn run(args: &[&str]) -> std::process::Output {
+    run_bare(&with_transforms(args))
+}
+
+/// Runs the binary with exactly the arguments given and nothing added.
+fn run_bare(args: &[&str]) -> std::process::Output {
     Command::new(BIN).args(args).output().expect("run binary")
+}
+
+fn with_transforms<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut all = Vec::with_capacity(args.len() + 2);
+    if !args.iter().any(|arg| *arg == "--bricks" || *arg == "--zaa") {
+        all.extend(["--bricks", "--zaa"]);
+    }
+    all.extend_from_slice(args);
+    all
 }
 
 /// Runs the binary the way a slicer would, with the print configuration
 /// exported into the environment.
 fn run_with_env(args: &[&str], settings: &[(&str, &str)]) -> std::process::Output {
     Command::new(BIN)
-        .args(args)
+        .args(with_transforms(args))
         .envs(settings.iter().copied())
         .output()
         .expect("run binary")
@@ -135,8 +160,8 @@ fn brick_rewrites_the_file_in_place() {
     let result = fs::read_to_string(&path).expect("read result");
     assert_ne!(result, source, "file should have been modified");
     assert_wellformed(&result);
-    assert!(result.contains("bricklayers brick raised"));
-    assert!(result.contains("bricklayers brick reset"));
+    assert!(result.contains("corbel brick raised"));
+    assert!(result.contains("corbel brick reset"));
 }
 
 #[test]
@@ -174,7 +199,7 @@ fn brick_never_leaves_the_nozzle_raised_into_the_next_region() {
                 .next()
                 .and_then(|value| value.parse().ok())
                 .expect("Z value");
-            if !line.contains("bricklayers") {
+            if !line.contains("corbel") {
                 layer_z = z;
             }
         }
@@ -236,12 +261,12 @@ fn the_wave_transform_is_gone() {
 /// nobody released says "dev" rather than a number kept in the source.
 #[test]
 fn the_version_comes_from_the_release_tag() {
-    let expected = option_env!("BRICKLAYERS_VERSION").unwrap_or("dev");
+    let expected = option_env!("CORBEL_VERSION").unwrap_or("dev");
     let output = run(&["--version"]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        format!("bricklayers {expected}")
+        format!("corbel {expected}")
     );
 }
 
@@ -255,7 +280,7 @@ fn output_flag_leaves_the_input_alone() {
     let output = run(&["-o", target.to_str().unwrap(), path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs::read_to_string(&path).unwrap(), source);
-    assert!(fs::read_to_string(&target).unwrap().contains("bricklayers"));
+    assert!(fs::read_to_string(&target).unwrap().contains("corbel"));
 }
 
 #[test]
@@ -338,7 +363,7 @@ fn the_layer_laid_on_the_bed_is_left_exactly_as_sliced() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !bed.contains("bricklayers"),
+        !bed.contains("corbel"),
         "the bed layer must come through untouched:\n{bed}"
     );
 }
@@ -356,14 +381,50 @@ fn a_comment_that_is_not_utf8_does_not_stop_the_transform() {
     let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
 
-    let result = fs::read_to_string(&path).expect("result is valid UTF-8");
+    let raw = fs::read(&path).expect("read result");
+    // The byte itself comes back, not a replacement character: the file is the
+    // user's only copy and a comment neither transform touched must be the
+    // bytes it arrived as, exactly as its line endings are.
+    assert!(
+        raw.starts_with(b"; printing object Caf\xe9\n"),
+        "{:?}",
+        String::from_utf8_lossy(&raw[..40.min(raw.len())])
+    );
+    let result = String::from_utf8_lossy(&raw).into_owned();
     assert_wellformed(&result);
-    assert!(result.contains("bricklayers brick raised"), "{result}");
-    assert!(result.contains("; printing object Caf"), "{result}");
+    assert!(result.contains("corbel brick raised"), "{result}");
     assert_eq!(
         result.matches("E0.66000").count(),
         4,
         "only the bed layer's visible wall may be left as sliced"
+    );
+}
+
+/// The same byte in a comment on a bead the transform *does* rewrite. Only the
+/// numbers it edits may change; everything either side of them is copied.
+#[test]
+fn a_rewritten_line_keeps_the_bytes_of_its_own_comment() {
+    let sandbox = Sandbox::new("latin1-move");
+    // A hidden-wall bead, which is re-metered wherever its loop is raised.
+    let source = sample_gcode().replacen("E0.64000\n", "E0.64000 ; note\n", 1);
+    let mut bytes = source.into_bytes();
+    let at = bytes
+        .windows(4)
+        .position(|window| window == b"note")
+        .expect("the marker is in the fixture");
+    bytes[at] = 0xe9;
+    let path = sandbox.with_bytes(&bytes);
+
+    assert!(run(&[path.to_str().unwrap()]).status.success());
+    let raw = fs::read(&path).expect("read result");
+    assert_eq!(
+        raw.iter().filter(|byte| **byte == 0xe9).count(),
+        1,
+        "the comment's own byte survived being re-metered"
+    );
+    assert!(
+        raw.windows(6).any(|window| window == b"; \xe9ote"),
+        "the comment is otherwise intact"
     );
 }
 
@@ -420,17 +481,17 @@ fn a_wall_closed_by_a_solid_surface_partway_up_is_left_flat() {
             .1
     };
     assert!(
-        !shoulder_of(3).contains("bricklayers brick raised"),
+        !shoulder_of(3).contains("corbel brick raised"),
         "the wall that stops must finish on the plane: {}",
         shoulder_of(3)
     );
     assert!(
-        shoulder_of(2).contains("bricklayers brick raised"),
+        shoulder_of(2).contains("corbel brick raised"),
         "while the layer below it still bricks: {}",
         shoulder_of(2)
     );
     assert!(
-        layers[3].contains("bricklayers brick raised"),
+        layers[3].contains("corbel brick raised"),
         "and so does the wall that carries on, on the same layer: {}",
         layers[3]
     );
@@ -450,7 +511,7 @@ fn verbose_reports_a_summary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("5 layers"), "{stderr}");
     // Three walls a layer, the visible one included.
-    assert!(stderr.contains("15 internal loops"), "{stderr}");
+    assert!(stderr.contains("15 perimeter loops"), "{stderr}");
     // One per layer, less the bed layer, which is never raised, and the top
     // one, which caps the wall flat.
     assert!(stderr.contains("3 raised"), "{stderr}");
@@ -900,8 +961,167 @@ fn crlf_input_is_accepted() {
     assert!(output.status.success(), "{output:?}");
 
     let result = fs::read_to_string(&path).expect("read result");
-    assert!(!result.contains('\r'));
+    // A file that arrived with Windows endings leaves with them. This used to
+    // assert the opposite — that every `\r` was gone — which is what made a
+    // Windows-authored file come back with every line changed.
+    assert_eq!(
+        result.matches('\n').count(),
+        result.matches("\r\n").count(),
+        "a bare newline was written into a CRLF file"
+    );
     assert_wellformed(&result);
+}
+
+/// Both transforms promise that a part they do not touch comes back untouched,
+/// and on a Windows-authored file that is a claim about every line: readers
+/// strip the `\r` and writers put back a bare `\n`. The last line here carries
+/// no ending at all, since one gained on the way out is a changed file too.
+#[test]
+fn a_crlf_file_with_nothing_to_do_comes_back_byte_for_byte() {
+    let sandbox = Sandbox::new("crlf-identical");
+    // No perimeter regions and no surface to follow, so neither transform has
+    // anything to work on and every line is copied through.
+    let source = "; generated by PrusaSlicer\r\n\
+                  M83\r\n\
+                  ;LAYER_CHANGE\r\n\
+                  G1 Z0.200 F9000\r\n\
+                  G1 X0 Y0 F9000\r\n\
+                  G1 X10 Y0 E0.50000\r\n\
+                  ;LAYER_CHANGE\r\n\
+                  G1 Z0.400 F9000\r\n\
+                  G1 X10 Y10 E0.50000\r\n\
+                  M104 S0";
+    let path = sandbox.with_bytes(source.as_bytes());
+
+    let output = run(&[path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(&path).expect("read result"),
+        source.as_bytes(),
+        "a file nothing was done to did not come back as it went in"
+    );
+}
+
+/// A slicer's output directory pointed at shared storage is a symbolic link,
+/// and `rename` replaces the link itself rather than the file it stands for:
+/// the real file would keep the G-code as it was sliced and the link would be
+/// gone.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_file_is_processed_where_it_really_lives() {
+    let sandbox = Sandbox::new("symlink");
+    let real = sandbox.with_named("real.gcode", sample_gcode().as_bytes());
+    let link = sandbox.path().join("part.gcode");
+    std::os::unix::fs::symlink(&real, &link).expect("link it");
+
+    let output = run(&[link.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+
+    let kind = fs::symlink_metadata(&link).expect("stat").file_type();
+    assert!(kind.is_symlink(), "the link was replaced by a regular file");
+    assert_eq!(fs::read_link(&link).expect("read the link"), real);
+
+    let result = fs::read_to_string(&real).expect("read the file it points at");
+    assert_wellformed(&result);
+    assert!(
+        result.contains("corbel"),
+        "the file the link stands for was never processed"
+    );
+}
+
+/// A rename publishes a new inode, so every other name hard-linked to the
+/// target keeps the file as it was sliced. Nothing in `std` can move them, so
+/// the run says so rather than leaving it to be discovered on the printer.
+#[cfg(unix)]
+#[test]
+fn other_names_for_the_same_file_are_reported_rather_than_left_in_silence() {
+    let sandbox = Sandbox::new("hard-links");
+    let source = sample_gcode();
+    let path = sandbox.with_gcode(&source);
+    let also = sandbox.path().join("also.gcode");
+    fs::hard_link(&path, &also).expect("hard link");
+
+    let output = run(&[path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("hard-linked"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&also).expect("read the other name"),
+        source,
+        "the warning describes what actually happened"
+    );
+}
+
+/// `--output` naming a directory used to put the temporary in that
+/// directory's PARENT — `with_file_name` on `/spool/prints` is
+/// `/spool/prints.<token>.tmp` — so a whole print was written somewhere the
+/// user never named before the rename failed.
+#[test]
+fn an_output_that_names_a_directory_fails_before_anything_is_written() {
+    let sandbox = Sandbox::new("output-directory");
+    let source = sample_gcode();
+    let path = sandbox.with_gcode(&source);
+    let directory = sandbox.path().join("spool");
+    fs::create_dir(&directory).expect("create the directory");
+
+    let output = run(&["-o", directory.to_str().unwrap(), path.to_str().unwrap()]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("directory"), "{stderr}");
+
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        source,
+        "the input moved"
+    );
+    assert!(
+        fs::read_dir(&directory).unwrap().next().is_none(),
+        "something was written into the directory"
+    );
+    let leftovers: Vec<_> = fs::read_dir(sandbox.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+}
+
+/// `SLIC3R_PP_OUTPUT_NAME` is a file name out of a project or 3MF the user may
+/// not have authored, and the slicer exports it exactly as it found it.
+#[test]
+fn a_name_the_slicer_exports_cannot_reach_the_terminal_as_an_instruction() {
+    let sandbox = Sandbox::new("hostile-name");
+    let path = sandbox.with_gcode(&sample_gcode());
+    let hostile = format!(
+        "part\u{1b}[2J\u{1b}]0;taken over\u{7}\u{202e}{}",
+        "x".repeat(500)
+    );
+
+    let output = run_with_env(
+        &["--verbose", path.to_str().unwrap()],
+        &[("SLIC3R_PP_OUTPUT_NAME", hostile.as_str())],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !output
+            .stderr
+            .iter()
+            .any(|byte| *byte == 0x1b || *byte == 0x07),
+        "an escape code reached the terminal"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("save this as"))
+        .expect("the name is still reported");
+    assert!(line.contains("part"), "{line}");
+    assert!(!line.contains('\u{202e}'), "{line}");
+    assert!(
+        line.chars().count() < 200,
+        "the name buried what was printed after it"
+    );
 }
 
 /// The binary streams a file through the same transform the library runs over a
@@ -996,5 +1216,613 @@ fn coordinates_on_a_rounding_boundary_survive_the_binary() {
                 "wrote {word} in: {line}"
             );
         }
+    }
+}
+
+/// A shallow cone in PrusaSlicer's dialect: a square whose side loses 3 mm a
+/// layer, so every layer leaves a 3 mm strip of itself exposed. The strip is
+/// covered by the wall stack and then by a top surface, which is what a slicer
+/// emits and what a staircase is made of.
+fn sloped_gcode(layers: usize) -> String {
+    sloped_gcode_at(layers, 0.2)
+}
+
+/// The same cone sliced at a stated layer height. How wide a step is worth
+/// following is a slope, so the height is what decides whether this file's
+/// 3 mm strip is one.
+fn sloped_gcode_at(layers: usize, height: f64) -> String {
+    let mut text = format!(
+        "; generated by PrusaSlicer\n\
+         M83 ; extruder relative mode\n\
+         ; layer_height = {height}\n\
+         ; perimeter_extrusion_width = 0.45\n\
+         ; nozzle_diameter = 0.4\n"
+    );
+    for layer in 0..layers {
+        // Three layers of vertical wall before the taper, so bricking has a
+        // column to raise and the taper has something under it to slope from.
+        let half = 30.0 - 3.0 * layer.saturating_sub(2) as f64;
+        text.push_str(";LAYER_CHANGE\n");
+        text.push_str(&format!("G1 Z{:.3} F600\n", height * (layer + 1) as f64));
+        for (label, half) in [
+            (";TYPE:Perimeter\n", half - 0.45),
+            (";TYPE:External perimeter\n", half),
+        ] {
+            text.push_str(label);
+            text.push_str(&format!("G1 X{:.3} Y{:.3} F9000\n", -half, -half));
+            for (x, y) in [(half, -half), (half, half), (-half, half), (-half, -half)] {
+                text.push_str(&format!("G1 X{x:.3} Y{y:.3} E1.00000\n"));
+            }
+        }
+        text.push_str(";TYPE:Top solid infill\n");
+        let (inner, outer) = (half - 3.0 + 0.35, half - 0.3);
+        for step in 0..5 {
+            let x = inner + (outer - inner) * step as f64 / 4.0;
+            let (from, to) = if step % 2 == 0 {
+                (-6.0, 6.0)
+            } else {
+                (6.0, -6.0)
+            };
+            text.push_str(&format!("G1 X{x:.3} Y{from:.3} F9000\n"));
+            text.push_str(&format!("G1 X{x:.3} Y{to:.3} E0.35000\n"));
+        }
+    }
+    text.push_str("M104 S0\n");
+    text
+}
+
+/// The heights every extruding move of a region was commanded at, with the
+/// axes each move left unnamed carried forward.
+fn heights_of(gcode: &str, region: &str) -> Vec<f64> {
+    let (mut z, mut here) = (0.0, false);
+    let mut found = Vec::new();
+    for line in gcode.lines() {
+        let body = line.split(';').next().unwrap_or("").trim();
+        if body.is_empty() {
+            if let Some(marker) = line.trim().strip_prefix(";TYPE:") {
+                here = marker.trim() == region;
+            }
+            continue;
+        }
+        for word in body.split_whitespace().skip(1) {
+            if let Some(digits) = word.strip_prefix('Z') {
+                z = digits.parse().expect("a number");
+            }
+        }
+        let lays = body.contains('E') && (body.contains('X') || body.contains('Y'));
+        if here && lays {
+            found.push(z);
+        }
+    }
+    found
+}
+
+/// The whole point: a shallow top comes out as a ramp rather than a staircase.
+/// Every bead with nothing printed over it follows the surface — the wall that
+/// shows, the hidden wall behind it and the top itself — and none of them ever
+/// stands more than half a layer off its own plane.
+#[test]
+fn a_shallow_top_is_followed_rather_than_stepped() {
+    let sandbox = Sandbox::new("zaa-slope");
+    let path = sandbox.with_gcode(&sloped_gcode(6));
+    let out = sandbox.path().join("zaa.gcode");
+    let output = run(&[
+        "--zaa",
+        "--verbose",
+        "--output",
+        out.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+
+    let result = fs::read_to_string(&out).expect("read result");
+    assert_wellformed(&result);
+    assert!(result.contains("corbel zaa surface"));
+
+    for region in ["External perimeter", "Top solid infill"] {
+        let heights = heights_of(&result, region);
+        assert!(!heights.is_empty(), "{region} is printed");
+        let off = heights
+            .iter()
+            .map(|z| (z * 5.0).round() / 5.0 - z)
+            .fold(0.0f64, |worst, off| worst.max(off.abs()));
+        assert!(off > 0.02, "{region} follows the surface: {off}");
+        assert!(off <= 0.1 + 1e-6, "{region} stays inside its layer: {off}");
+    }
+    // The hidden wall follows too, since nothing has raised it out from
+    // under this run's feet.
+    let hidden = heights_of(&result, "Perimeter");
+    assert!(!hidden.is_empty(), "the hidden wall is printed");
+    let off = hidden
+        .iter()
+        .map(|z| (z * 5.0).round() / 5.0 - z)
+        .fold(0.0f64, |worst, off| worst.max(off.abs()));
+    assert!(off > 0.02, "the hidden wall follows the surface: {off}");
+    assert!(
+        off <= 0.1 + 1e-6,
+        "the hidden wall stays inside its layer: {off}"
+    );
+
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(report.contains("surface moves on"), "{report}");
+}
+
+/// Bricking raises alternate hidden loops half a layer, and the surface
+/// transform cannot see which. Lowering a wall onto one would close a gap the
+/// slicer metered open, so a run that does both leaves the hidden wall exactly
+/// where bricking put it and follows only what it owns outright.
+#[test]
+fn the_hidden_wall_is_left_alone_when_bricking_is_running_too() {
+    let sandbox = Sandbox::new("zaa-bricked");
+    let path = sandbox.with_gcode(&sloped_gcode(6));
+
+    let mut heights = Vec::new();
+    for (name, switches) in [
+        ("bricks", &["--bricks"][..]),
+        ("both", &["--bricks", "--zaa"]),
+    ] {
+        let out = sandbox.path().join(format!("{name}.gcode"));
+        let output = run(&[
+            switches,
+            &["--output", out.to_str().unwrap(), path.to_str().unwrap()],
+        ]
+        .concat());
+        assert!(output.status.success(), "{output:?}");
+        let result = fs::read_to_string(&out).expect("read result");
+        assert_wellformed(&result);
+        heights.push((heights_of(&result, "Perimeter"), result));
+    }
+
+    let (bricked, _) = &heights[0];
+    let (both, result) = &heights[1];
+    assert!(!bricked.is_empty(), "the hidden wall is printed");
+    assert_eq!(bricked, both, "the surface transform moved a hidden bead");
+
+    // And it is a run that did something, or the comparison proves nothing.
+    let shown = heights_of(result, "External perimeter");
+    assert!(
+        shown
+            .iter()
+            .any(|z| ((z * 5.0).round() / 5.0 - z).abs() > 0.02),
+        "the wall that shows still follows the surface"
+    );
+}
+
+/// The same guard, across two runs of the binary rather than one. A file
+/// carries the stamp of the bricking an earlier run did, so the bead under a
+/// hidden wall can stand half a layer proud whether or not `--bricks` is named
+/// this time. Reading the switch alone hands the file to a surface pass that
+/// believes it owns walls it does not.
+#[test]
+fn a_file_bricked_by_an_earlier_run_still_owns_its_hidden_walls() {
+    let sandbox = Sandbox::new("zaa-was-bricked");
+    let path = sandbox.with_gcode(&sloped_gcode(6));
+
+    let bricked = sandbox.path().join("bricked.gcode");
+    let output = run(&[
+        "--bricks",
+        "--output",
+        bricked.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let before = fs::read_to_string(&bricked).expect("read bricked");
+
+    // `--force`, since running a transform over a file that already carries
+    // the other one's work is what this is about.
+    let after_path = sandbox.path().join("then-zaa.gcode");
+    let output = run(&[
+        "--zaa",
+        "--force",
+        "--output",
+        after_path.to_str().unwrap(),
+        bricked.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let after = fs::read_to_string(&after_path).expect("read result");
+    assert_wellformed(&after);
+
+    assert_eq!(
+        heights_of(&before, "Perimeter"),
+        heights_of(&after, "Perimeter"),
+        "the surface transform moved a bead bricking owns"
+    );
+    // And it is a run that did something, or the comparison proves nothing.
+    let shown = heights_of(&after, "External perimeter");
+    assert!(
+        shown
+            .iter()
+            .any(|z| ((z * 5.0).round() / 5.0 - z).abs() > 0.02),
+        "the wall that shows still follows the surface"
+    );
+}
+
+/// A slicer's post-processing field holds a path and nothing else, so a run
+/// with no arguments has to do everything. Naming one transform is how you get
+/// only that one.
+#[test]
+fn naming_a_transform_runs_that_one_alone_and_naming_none_runs_both() {
+    let sandbox = Sandbox::new("zaa-pick");
+    let path = sandbox.with_gcode(&sloped_gcode(6));
+
+    for (name, args, bricked, contoured) in [
+        ("both", vec![], true, true),
+        ("bricks", vec!["--bricks"], true, false),
+        ("zaa", vec!["--zaa"], false, true),
+        ("named", vec!["--bricks", "--zaa"], true, true),
+    ] {
+        let out = sandbox.path().join(format!("{name}.gcode"));
+        let mut call = args.clone();
+        call.extend(["--output", out.to_str().unwrap(), path.to_str().unwrap()]);
+        let output = run(&call);
+        assert!(output.status.success(), "{name}: {output:?}");
+
+        let result = fs::read_to_string(&out).expect("read result");
+        assert_wellformed(&result);
+        assert_eq!(result.contains("corbel brick "), bricked, "{name} bricking");
+        assert_eq!(
+            result.contains("corbel zaa "),
+            contoured,
+            "{name} contouring"
+        );
+    }
+}
+
+/// Both at once is the default, and the two must not fight: bricking owns the
+/// hidden walls' height and the surface transform owns the rest. Every value
+/// that reaches the printer still has to be one it can act on.
+#[test]
+fn both_transforms_at_once_leave_coherent_gcode() {
+    let sandbox = Sandbox::new("zaa-both");
+    let path = sandbox.with_gcode(&sloped_gcode(8));
+    let out = sandbox.path().join("both.gcode");
+    let output = run(&[
+        "--verbose",
+        "--output",
+        out.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+
+    let result = fs::read_to_string(&out).expect("read result");
+    assert_wellformed(&result);
+    assert!(result.contains("corbel brick "));
+    assert!(result.contains("corbel zaa "));
+
+    // Nothing below the bed, and nothing further than a layer off its plane.
+    for line in result.lines() {
+        let body = line.split(';').next().unwrap_or("");
+        for word in body.split_whitespace().skip(1) {
+            if let Some(digits) = word.strip_prefix('Z') {
+                let z: f64 = digits.parse().expect("a number");
+                assert!((0.1..=1.7).contains(&z), "commanded {line}");
+            }
+        }
+    }
+    // The filament stream never runs backwards.
+    let mut spent = 0.0;
+    for line in result.lines() {
+        let body = line.split(';').next().unwrap_or("").trim();
+        if !body.starts_with("G1") && !body.starts_with("G0") {
+            continue;
+        }
+        for word in body.split_whitespace().skip(1) {
+            if let Some(digits) = word.strip_prefix('E') {
+                let delta: f64 = digits.parse().expect("a number");
+                assert!(delta >= 0.0, "backwards: {line}");
+                spent += delta;
+            }
+        }
+    }
+    assert!(spent > 0.0);
+
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(report.contains("perimeter loops"), "{report}");
+    assert!(report.contains("surface moves on"), "{report}");
+}
+
+/// Running twice would measure a surface against a plane it is no longer on,
+/// so a file carrying either transform's marks is refused rather than
+/// processed again.
+#[test]
+fn a_file_that_has_already_been_contoured_is_refused() {
+    let sandbox = Sandbox::new("zaa-again");
+    let path = sandbox.with_gcode(&sloped_gcode(6));
+    let once = sandbox.path().join("once.gcode");
+    assert!(
+        run(&[
+            "--zaa",
+            "--output",
+            once.to_str().unwrap(),
+            path.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+
+    let before = fs::read_to_string(&once).expect("read result");
+    let output = run(&["--zaa", once.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("has already been contoured"), "{message}");
+    assert_eq!(
+        fs::read_to_string(&once).expect("read result"),
+        before,
+        "the file is left alone"
+    );
+
+    // And --force is the way through, as it is for bricking.
+    assert!(
+        run(&["--zaa", "--force", once.to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+/// How wide a step is worth following is a slope, and a slope is a width over
+/// a layer height — so the same file's 3 mm strip is a ramp at 0.2 mm layers
+/// and is flat at 0.04 mm ones, where it comes back untouched. Nothing on the
+/// command line says so; the file does.
+///
+/// The shallow height has to clear the fade as well as the reach: everything
+/// down to one degree is followed at full amplitude and the quarter past it is
+/// where the amplitude tapers away, so 3 mm at 0.05 mm layers is 0.955° and is
+/// still carried. At 0.04 mm it is 0.76°, past the taper and left alone.
+#[test]
+fn how_shallow_a_surface_has_to_be_follows_its_layer_height() {
+    let sandbox = Sandbox::new("zaa-slope-angle");
+
+    for (height, followed) in [(0.2, true), (0.04, false)] {
+        let path = sandbox.with_gcode(&sloped_gcode_at(6, height));
+        let out = sandbox.path().join(format!("reach-{height}.gcode"));
+        let output = run(&[
+            "--zaa",
+            "--output",
+            out.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        let result = fs::read_to_string(&out).expect("read result");
+        assert_eq!(
+            result.contains("corbel zaa surface"),
+            followed,
+            "a 3 mm step at {height} mm layers"
+        );
+        if !followed {
+            assert_eq!(result, fs::read_to_string(&path).expect("read input"));
+        }
+    }
+}
+
+/// A part with no shallow surface has nothing to smooth, and has to come back
+/// exactly as it arrived rather than with a height command it never asked for.
+#[test]
+fn a_part_with_nothing_to_smooth_comes_back_untouched() {
+    let sandbox = Sandbox::new("zaa-nothing");
+    let source = sample_gcode();
+    let path = sandbox.with_gcode(&source);
+    let out = sandbox.path().join("zaa.gcode");
+    let output = run(&[
+        "--zaa",
+        "--verbose",
+        "--output",
+        out.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(&out).expect("read result"), source);
+
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(report.contains("no surface shallow enough"), "{report}");
+}
+
+/// Each transform's settings are grouped under its own heading, so a reader of
+/// `--help` can tell which dial belongs to which.
+#[test]
+fn help_groups_each_transforms_settings_under_its_own_heading() {
+    let output = run_bare(&["--help"]);
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    for heading in ["Bricklayering:", "Z anti-aliasing:"] {
+        assert!(help.contains(heading), "{heading} missing from:\n{help}");
+    }
+    let bricks = help.find("Bricklayering:").expect("a heading");
+    let contours = help.find("Z anti-aliasing:").expect("a heading");
+    let after = |at: usize, next: usize| &help[at..next];
+    assert!(after(bricks, contours).contains("--bricks"), "{help}");
+    assert!(after(bricks, contours).contains("--extra-flow"), "{help}");
+    assert!(
+        help[contours..]
+            .lines()
+            .any(|line| line.trim_start().starts_with("--zaa ")),
+        "{help}"
+    );
+    // What both share stays above them, where a reader looks first.
+    assert!(help[..bricks].contains("--output"), "{help}");
+    assert!(help[..bricks].contains("--verbose"), "{help}");
+    // And the usage line says up front that one of them has to be named.
+    let usage = help.lines().find(|line| line.contains("corbel [OPTIONS]"));
+    let usage = usage.expect("a usage line");
+    assert!(
+        usage.contains("--bricks") && usage.contains("--zaa"),
+        "{usage}"
+    );
+}
+
+/// Naming no transform is refused, with a non-zero exit code, rather than
+/// given a default.
+///
+/// A slicer runs this over the user's only copy of a file and swallows
+/// everything it prints, so the one thing it must never do is apply a
+/// transform nobody asked for. The failure has to name both switches, since
+/// the message is all a reader gets.
+#[test]
+fn naming_no_transform_fails_instead_of_choosing_one() {
+    let sandbox = Sandbox::new("no-transform");
+    let source = sample_gcode();
+    let path = sandbox.with_gcode(&source);
+
+    let output = run_bare(&[path.to_str().unwrap()]);
+    assert!(!output.status.success(), "{output:?}");
+    assert_ne!(output.status.code(), Some(0));
+
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(complaint.contains("--bricks"), "{complaint}");
+    assert!(complaint.contains("--zaa"), "{complaint}");
+
+    // And the file it was pointed at is exactly as it was.
+    assert_eq!(fs::read_to_string(&path).expect("read input"), source);
+}
+
+/// Each switch runs its own transform and only its own, and the two together
+/// run both. What each writes is stamped, so which ran is read off the file
+/// rather than off the report.
+#[test]
+fn each_switch_selects_exactly_its_own_transform() {
+    let sandbox = Sandbox::new("select");
+    let source = sloped_gcode(14);
+    let path = sandbox.with_gcode(&source);
+
+    for (args, bricked, contoured) in [
+        (vec!["--bricks"], true, false),
+        (vec!["--zaa"], false, true),
+        (vec!["--bricks", "--zaa"], true, true),
+    ] {
+        let out = sandbox.path().join(format!("{}.gcode", args.join("")));
+        let mut all = args.clone();
+        all.extend(["--output", out.to_str().unwrap(), path.to_str().unwrap()]);
+        let output = run_bare(&all);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+
+        let result = fs::read_to_string(&out).expect("read result");
+        assert_eq!(
+            result.contains("corbel brick "),
+            bricked,
+            "{args:?} should{} brick",
+            if bricked { "" } else { " not" }
+        );
+        assert_eq!(
+            result.contains("corbel zaa "),
+            contoured,
+            "{args:?} should{} contour",
+            if contoured { "" } else { " not" }
+        );
+    }
+}
+
+/// PrusaSlicer 2.8.1 binary G-code, the same fixture the container tests use.
+const BINARY_SINGLE: &[u8] = include_bytes!("fixtures/mini_cube_ps2.8.1.bgcode");
+/// PrusaSlicer 2.6.0 binary G-code, ten G-code blocks.
+const BINARY_MULTI: &[u8] = include_bytes!("fixtures/mini_cube_b.bgcode");
+
+/// The head of a 3MF, which is a zip: the local file header, then a deflated
+/// member. Anything a mistyped path lands on looks like this rather than like
+/// G-code, and the zero bytes in the header are the giveaway.
+const THREE_MF: &[u8] = b"PK\x03\x04\x14\x00\x00\x00\x08\x00\x00\x00!\x00\
+    \x9b\xc7\x1d\x8b\x1c\x02\x00\x00\x8b\x05\x00\x00\x13\x00\x00\x00\
+    [Content_Types].xml\xad\x94\xcbn\xdb0\x10E\xf7\x05\xfa\x07A\xbb";
+
+/// An ASCII STL: no zero byte anywhere, and not one line that reads as a
+/// command or a comment.
+const ASCII_STL: &str = "solid cube\n\
+     facet normal 0 0 -1\n\
+     outer loop\n\
+     vertex 0 0 0\n\
+     vertex 20 20 0\n\
+     vertex 20 0 0\n\
+     endloop\n\
+     endfacet\n\
+     endsolid cube\n";
+
+/// A file that is not G-code is refused with the original left byte for byte
+/// as it was.
+///
+/// The default output target is the input itself and a slicer hands over the
+/// only copy it has, so a mistyped path onto a model would otherwise come back
+/// rewritten past recovery — every byte that is not UTF-8 replaced, every
+/// terminator changed — and exit zero while doing it.
+#[test]
+fn a_file_that_is_not_gcode_is_refused_and_left_byte_identical() {
+    let sandbox = Sandbox::new("not-gcode");
+
+    for (name, source) in [
+        ("model.3mf", THREE_MF),
+        ("model.stl", ASCII_STL.as_bytes()),
+        ("empty.gcode", b"".as_slice()),
+    ] {
+        let path = sandbox.with_named(name, source);
+        let output = run(&[path.to_str().unwrap()]);
+
+        assert!(!output.status.success(), "{name} was accepted: {output:?}");
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        assert!(complaint.contains(name), "{name}: {complaint}");
+        assert!(
+            complaint.contains("does not read as G-code"),
+            "{name}: {complaint}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read the input back"),
+            source,
+            "{name} was rewritten by a refused run"
+        );
+    }
+
+    // The refusal lands before a sink is ever opened, so not even a temporary
+    // appears beside the file.
+    let mut left: Vec<String> = fs::read_dir(sandbox.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["empty.gcode", "model.3mf", "model.stl"]);
+}
+
+/// `--force` already means "I know what I am doing" for a file that carries an
+/// earlier run's marks, and it is the only thing that overrides the refusal.
+#[test]
+fn force_processes_a_file_that_does_not_read_as_gcode() {
+    let sandbox = Sandbox::new("force-not-gcode");
+    let path = sandbox.with_named("model.stl", ASCII_STL.as_bytes());
+    let target = sandbox.path().join("out.gcode");
+
+    let output = run(&[
+        "--bricks",
+        "--force",
+        "-o",
+        target.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let result = fs::read_to_string(&target).expect("read the result");
+    assert!(
+        result.contains("endsolid cube"),
+        "--force must process it rather than refuse it: {result}"
+    );
+}
+
+/// The refusal must not reach a real file, whichever container it arrived in.
+/// A binary container is binary on disk and G-code once decoded, so it is the
+/// decoded stream that has to be judged.
+#[test]
+fn gcode_is_still_accepted_however_it_is_packed() {
+    let sandbox = Sandbox::new("still-gcode");
+
+    let plain = sandbox.with_gcode(&sample_gcode());
+    let output = run(&[plain.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+
+    for (name, fixture) in [
+        ("single.bgcode", BINARY_SINGLE),
+        ("multi.bgcode", BINARY_MULTI),
+    ] {
+        let path = sandbox.with_named(name, fixture);
+        let output = run(&["--verbose", path.to_str().unwrap()]);
+        let report = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !report.contains("does not read as G-code"),
+            "{name} was judged on its container rather than on its G-code: {report}"
+        );
     }
 }

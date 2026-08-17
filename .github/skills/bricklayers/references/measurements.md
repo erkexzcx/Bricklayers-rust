@@ -126,6 +126,41 @@ have a multi-loop wall:
 changed (19 → 20 → 21 → 22 …). The remaining 6 are the 9 layers OrcaSlicer
 chooses to print outer-first.
 
+## What a bead is laid on (2026-08-13)
+
+An inversion is not only a lost stagger — it is a **metering** event. Until this
+was measured, the span a bead was fed for came from its own parity, so a loop
+laid on the plane over a column that had been raised was fed for a whole layer
+of gap when half of it was already filled.
+
+`audit.py flow OUT IN` is the measurement: it matches each internal bead to the
+column beneath it and compares `E_out/E_in` against `(h + rise − rise_below)/h ×
+flow`. Stock OrcaSlicer 2.4.2 Benchy, 0.2 mm layers, 0.4 nozzle, arc fitting on:
+
+| file | over-fed before | over-fed after | worst ratio |
+|---|---|---|---|
+| Benchy, 2 walls | 188 mm (0.88%) | **10 mm (0.04%)** | 2.00× |
+| Benchy, 1000 walls | 2575 mm (3.23%) | **857 mm (1.08%)** | 2.00× |
+
+The over-fed path is concentrated at **Z8–15 on the 2-wall file**, which is
+where the hull flares hardest and the wall renumbers most often. Every ratio
+seen is a clean fraction — 2.00 (flat over a raise, fed for a full layer), 0.67
+(raised over the plane, fed for one layer where it spans one and a half), 0.50,
+0.80, 0.83, 1.33 — so any new ratio is worth explaining before it is accepted.
+
+The share of a loop's path standing on the layer below's raised footprint is
+strongly bimodal, which is what lets `SEAM_SHARE` sit at 0.25:
+
+| share of path over the raise below | loops on the plane | loops carrying a raise on |
+|---|---|---|
+| 0.0–0.1 | 789 / 798 (2 walls), 1848 / 2052 (1000) | 11 (2 walls), 112 (1000) |
+| 0.4–1.0 | 5 (2 walls), 76 (1000) | 519 / 542 (2 walls), 1599 (1000) |
+
+Sweeping the threshold on both files: 0.10 leaves 21.6% of the 1000-wall path
+under-fed, 0.50 puts 2.8% of the 2-wall path back to over-fed. 0.20 and 0.25 are
+indistinguishable on the 2-wall file; 0.25 is the better of the two on the
+1000-wall one.
+
 ## Arcs
 
 benchy-orig, by region:
@@ -160,7 +195,7 @@ This has held through every rewrite of the grouping rule and is the check that
 matters most.
 
 **The first version of this check was worthless.** It tracked the raise from the
-`; bricklayers brick raised` marker and cleared it on any other stamped line —
+`; corbel brick raised` marker and cleared it on any other stamped line —
 including the `resume` line that immediately follows every raise. It therefore
 had a window of one line and would have reported 0 on anything.
 `scripts/audit.py` now compares the nozzle Z against the height the file itself

@@ -10,7 +10,6 @@ it. Run `pin.py` first if you have touched either side.
 writes `interlock-light.png` and `interlock-dark.png`, the pair README.md
 switches between with `<picture>`.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -261,6 +260,14 @@ beside a 0.2 mm layer. This is the one quantity in the picture drawn out of
 scale, and it is drawn out of scale so that it can be seen at all.
 """
 
+SWITCH_SIZE = 11.0
+"""Point size of the "what --x does" line under the panel a transform produces.
+
+Both figures name their own switch, in the same words at the same size and in
+the same faint ink, so a reader moving between them reads one label rather than
+two conventions. `contour.py` imports this.
+"""
+
 FLATTEN = 3.0
 """How hard the boundary wave saturates, so its crests are flats not points.
 
@@ -450,18 +457,21 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
             sliced,
             False,
             "as sliced",
+            "",
             "every gap lines up\na channel straight through the wall",
         ),
         (
             sliced,
             True,
             "bricked",
+            "what --bricks --extra-flow 0 does",
             "the gaps stagger — but open up\nless bead touches bead: a weaker joint",
         ),
         (
             cfg,
             True,
             "bricked + extra flow",
+            "what --bricks does",
             "filled, and keyed into\nmore contact than as sliced, and no channel",
         ),
     ]
@@ -479,7 +489,7 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
     size = (2.0 * SIDE + 3.0 * pane_width + 2.0 * GUTTER, CROWN + PANEL + FOOT)
     figure, panes = plt.subplots(1, 3, figsize=size, facecolor=theme.paper)
 
-    for at, (axes, (shown, bricked, title, caption)) in enumerate(zip(panes, steps)):
+    for axes, (shown, bricked, title, switch, caption) in zip(panes, steps):
         axes.set_facecolor(theme.paper)
         panel(axes, shown, bricked, theme)
         axes.set_title(title, color=theme.ink, fontsize=15, pad=18, fontweight="bold")
@@ -488,16 +498,16 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
         axes.set_aspect("equal")
         axes.axis("off")
 
-        if at == 2:
+        if switch:
             axes.text(
                 0.5,
                 1.012,
-                "what bricklayers does by default",
+                switch,
                 transform=axes.transAxes,
                 ha="center",
                 va="bottom",
-                color=theme.ink,
-                fontsize=11,
+                color=theme.faint,
+                fontsize=SWITCH_SIZE,
             )
 
         # The face the eye lands on. It is on the same line in all three, which
@@ -594,8 +604,9 @@ def draw(cfg: Wall, theme: Theme, out: Path) -> Path:
 
 
 def main() -> None:
+    here = Path(__file__).resolve().parents[4]
     parse = argparse.ArgumentParser(description=__doc__)
-    parse.add_argument("--output-dir", type=Path, default=Path("."))
+    parse.add_argument("--output-dir", type=Path, default=here / "img")
     parse.add_argument("--stem", default="interlock")
     parse.add_argument("--layers", type=int, default=10)
     parse.add_argument("--loops", type=int, default=5)

@@ -1,9 +1,9 @@
 ---
 name: bricklayers
-description: Domain knowledge for the bricklayers G-code post-processor — how brick layering works geometrically, how perimeter loops are grouped into contours, which signals in sliced G-code are trustworthy and which are traps, real-file measurements, and an audit script for verifying output. Use when changing src/brick.rs, src/scan.rs or src/feature.rs, when a user reports that bricking looks wrong or does nothing, when reasoning about loop detection, contour boundaries, raise parity, extrusion factors, arcs, wall order, or slicer dialects, and before trusting any claim about what a slicer emits.
+description: Domain knowledge for corbel's BrickLayers transform — how brick layering works geometrically, how perimeter loops are grouped into contours, which signals in sliced G-code are trustworthy and which are traps, real-file measurements, and an audit script for verifying output. Use when changing src/brick.rs, src/scan.rs or src/gcode/feature.rs, when a user reports that bricking looks wrong or does nothing, when reasoning about loop detection, contour boundaries, raise parity, extrusion factors, arcs, wall order, or slicer dialects, and before trusting any claim about what a slicer emits.
 ---
 
-# Bricklayers
+# BrickLayers
 
 Everything here was established by measuring real sliced G-code, not by reading
 slicer source or reasoning from first principles. Where a number appears, it
@@ -116,7 +116,7 @@ Four consequences that are easy to get backwards:
    do NOT scale it by more than `m`: the joint then receives 3 units where every
    other joint receives 2.
 
-   The offset itself is `src/inset.rs` and it always goes **left of the
+   The offset itself is `src/geometry/inset.rs` and it always goes **left of the
    direction of travel**: slicers emit an island anticlockwise and a hole
    clockwise, so left is the material side of both and nothing has to work out
    which it was handed. `Pass::flush_skin` buffers the region, `Pass::move_skin`
@@ -227,6 +227,28 @@ Four consequences that are easy to get backwards:
    nothing, which is just "scale the raised loops only" at twice the rate.
    There is no uniform-plus-edge-correction solution to those rules.
 
+   **The wall facing the infill is NOT moved outward by the mirror of this, and
+   the reason is the slack that is already there.** The arithmetic is
+   symmetric — offset the innermost loop by the same `skin_offset()` with the
+   sign flipped and its inner face lands exactly where the slicer drew it — but
+   the two faces are not comparable. The visible wall's outer face has no
+   slack: it is the part's dimension. The innermost wall's inner face has slack
+   the slicer chose. Measured on a stock 2-wall OrcaSlicer Benchy
+   (`target/tmp/infill_gap.py`, nearest separately-metered material to every
+   internal-wall sample, per layer): the gap peaks hard at **0.34 to 0.36 mm**
+   against the 0.39 to 0.41 mm two beads touching would give, i.e. the slicer
+   already runs infill **0.04 to 0.06 mm inside the wall's centreline** — the
+   file's own `infill_wall_overlap = 15%`. What the mirror move would correct
+   is `(flow − 1)/2 × spacing` = **5.1 µm** at the derived 1.025, a tenth of a
+   slack that is a dial on the slicer's own page.
+
+   It is also not reliably the loop that faces infill. On that same Benchy
+   **9.3% of internal wall path has no separately-metered material within
+   2 mm** of it — the hull is thin enough there that two wall bands meet — and
+   on the 1000-wall version it is 56.6%. Those loops face a staggered
+   wall-to-wall joint, and pinning both edges of a band is exactly what starves
+   one. Do not reopen this without a sectioned print.
+
    **None of this is measured yet.** Whether a void opens at the staggered
    joint, and how big it is, has never been checked against a sectioned print.
    The offset is a defensible construction, not a finding. Anything built on
@@ -240,14 +262,34 @@ Four consequences that are easy to get backwards:
    deep. `RAMP` (2) spreads it: no bead spans more than a quarter of a layer
    beyond what the slicer metered it for, and the layer on the plate comes
    through byte for byte.
-4. **One formula covers all of it.** `extrusion_factor` is
-   `(layer_height + rise(k) - rise(k-1)) / layer_height`, where `rise` is the
-   column's offset `k` layers into the object. It falls out at 1.0 on the bed
+4. **One formula covers all of it.** `Pass::geometry` is
+   `(layer_height + rise(here) - rise(under)) / layer_height`, where `rise` is
+   the column's offset. It falls out at 1.0 on the bed
    (nothing has risen yet), 1.25 on each climbing layer, 1.0 once the column is
-   up — which is where the wall flow applies instead — and 0.5 where
-   `capping()` forces the offset back to zero. A column capped before it
+   up — which is where the wall flow applies instead — and 0.5 where a cap
+   forces the offset back to zero. A column capped before it
    finished climbing gives back only what it took, e.g. 0.75.
-5. **A column has to be capped wherever it ends, not only at the top of the
+5. **Both ends of that span are MEASURED, never inferred from the parity.** A
+   loop's parity is not its column's history: numbering runs from the visible
+   wall inward, so a wall that gains or loses a loop renumbers, and a flaring
+   hull does that every few layers. The loop then laid on the plane can sit
+   directly over a bead standing half a layer proud — metered for a whole layer
+   it pours **exactly twice** what the gap holds, which is a blob on an
+   overhanging surface. Measured on a stock 2-wall Benchy, **188 mm of internal
+   wall path at exactly 2.00×**, most of it between Z8 and Z15 where the hull
+   flares hardest; 2575 mm on the 1000-wall version. So `Pass.rising` collects
+   the cells each layer leaves standing proud, `Pass.standing` is the layer
+   below's, and `Loop.on_a_raise` tests a loop's own path against it.
+   `SEAM_SHARE` (0.25) is the threshold and it is **not** `CAP_SHARE`: capping
+   asks whether a column *ends*, where being wrong costs a void, and this asks
+   what a bead *sits on*, where being wrong the same way costs a blob, so it is
+   biased the other way. It can be, because the two populations barely touch —
+   a loop laid on the plane shares a tenth of its path or less with the raise
+   below, a loop carrying a raised column on shares 0.4 to 1.0, and the valley
+   between is empty. `CAP_SHARE` cuts straight through the upper population.
+   Record the cells during the walk `shares` already makes: walking a second
+   time for them cost +22% of `brick` where folding them in costs +16%.
+6. **A column has to be capped wherever it ends, not only at the top of the
    part.** Whatever the slicer prints over a raised bead was metered for a full
    layer, and a bead standing half a layer proud leaves it half a gap. That is
    only harmless where the thing above is the same column, raised too. A
@@ -258,7 +300,7 @@ Four consequences that are easy to get backwards:
    bead 0.1 mm proud, 8.84 of that layer's 12.01 mm of filament going into half
    a gap, with the fan off. Testing the object's last wall layer alone — which
    is what `object_tops` does — caught the part's own top and nothing else.
-6. **`layer_height` in that formula is the layer's OWN height, and so is the
+7. **`layer_height` in that formula is the layer's OWN height, and so is the
    one behind `rise(k-1)`.** Where a slicer varied the height, half of one
    nominal is wrong nearly everywhere: measured on an adaptive Benchy the
    layers run 0.0808 to 0.1186 mm while the profile still says `0.2`, and
@@ -277,11 +319,36 @@ fragments a thin wall broke into. Numbering has to restart at each of them.
 
 ### What works
 
-Two loops are the same wall when **their paths run within `MAX_LOOP_GAP`
-(2.0 mm) of each other** — `Pass::adjacent` in `src/brick.rs`. A bounding-box
-comparison rejects most pairs first; then up to `PROBES` (16) sampled points of
-the current loop are tested against every point of the previous one, with an
-early exit.
+Two loops are the same wall when **most of one's path runs within
+`MAX_LOOP_GAP` (2.0 mm) of the other's** — `Pass::adjacent` in `src/brick.rs`.
+A bounding-box comparison rejects most pairs first; then up to `PROBES` (16)
+sampled points of one loop are tested against every point of the other, with an
+early exit as soon as neither the probes left nor the ones already counted can
+change the answer.
+
+**Coming close somewhere is not enough, and asking only that was a bug.**
+`BESIDE_SHARE` (0.5) is how much of the probed path has to run within the gap,
+and it is measured **both ways round** because a wall that widens leaves the
+shorter loop beside the longer along the whole of itself while the longer runs
+on past its end. A second wall passing close by is not like that: a 5 mm hole
+1.2 mm from a straight wall has a quarter of its path within the gap, and on
+the "anywhere" test that pulled the hole into the island's contour, where its
+loops were ordered by their distance to the island's visible wall — a distance
+that drifts layer to layer on anything tapered or curved, so the hole's stagger
+flipped from one layer to the next and the hole's own visible wall sat in a
+contour of its own that is never raised.
+
+**A loop is probed along its path, not at its endpoints.** A `G2`/`G3` states
+only where it ends, so two concentric arc-fitted loops a bead apart whose
+slicer cut them at different angles measure a chord's bulge apart rather than a
+bead: at a 10 mm radius a 45° disagreement puts their endpoints 7.5 mm from
+each other, far past `MAX_LOOP_GAP`, so every loop of a curved wall became a
+contour of its own and the whole stagger was lost — which is every curved wall
+a slicer with arc fitting on emits, and that is the Bambu Studio default.
+`Pass::points` walks an arc round at `ARC_STEP` (`MAX_LOOP_GAP / 4`), which
+leaves the worst sampling error an eighth of the gap being tested and is about
+the spacing a slicer puts between the vertices of a loop it did *not* fit an
+arc to.
 
 Measured over five prints: neighbouring loops of one wall run 0.4–1.5 mm apart,
 the next island is more than 3 mm away, and almost nothing falls in between.
@@ -403,6 +470,32 @@ claimed raising a lone loop "lifts the whole wall clear of the visible one".
 A lone *contour* means no other internal loop is adjacent, not that nothing is
 adjacent. Only a single-wall region has nothing to raise.
 
+### Fillers: gap fill and thin walls
+
+`brick::is_filler` covers `Feature::GapFill` and `Feature::ThinWall`, and they
+are **buffered with the wall they interrupt but are not loops of it**.
+
+- **Buffered, never written straight out.** Both arrive in the middle of a
+  wall, so a filler emitted as it arrives lands ahead of loops the slicer laid
+  before it, and the loops either side of it fall into different contours.
+  `Pass::fills_a_buffered_wall` is the gate: a filler joins the buffer only
+  where there is a wall in it to keep whole.
+- **Never raised, and never taking a place in the alternation.** A thin wall is
+  what a wall becomes where it narrows to under two beads, so **both** its
+  faces are the visible one — half a layer of step on it is half a layer of
+  step on the outside of the part. Gap fill has no column of its own to
+  stagger.
+- **They are metered differently, and that is deliberate.** Gap fill is laid
+  down into the valley *between* two beads and straddles whatever those two
+  did, so it comes out **exactly as the slicer wrote it** — factor 1.0, no wall
+  flow. A thin wall is a bead of its own with a plane under it, so it takes
+  `Pass::geometry` like any other bead: where that plane is a column standing
+  half a layer proud it has half the gap to fill. That is also the one reason a
+  filler may count as covering a raise beneath it.
+
+So "gap fill comes out as sliced" is true of gap fill and **not** of a thin
+wall. Both are `is_filler`; only one of them is metered as sliced.
+
 ## Gotchas
 
 Each of these cost a wrong answer or a shipped bug.
@@ -429,10 +522,30 @@ Each of these cost a wrong answer or a shipped bug.
   moves are `G2`/`G3`, and a whole ring arrives as two or three of them. Taking
   their chords would report every ring as covering nothing and cap the lot.
   `Line::arc()` carries `I`/`J` and the direction; `G2` is clockwise.
-- **The survey and the rewrite must agree on what extrudes.** The rewrite asks
-  about cells the survey drew, so `Scan` uses the same test the rewrite opens a
-  loop with (`delta > 0` and both `X` and `Y` present). A stricter test in the
-  survey would make loops look uncovered that are not.
+- **The survey and the rewrite must agree on what extrudes, and they agree by
+  asking one predicate.** The rewrite asks about cells the survey drew, so a
+  bead one of them counts and the other does not is a cell asked about that was
+  never drawn. Both call `Line::draws_in_plane`: a move that names `X` or `Y`,
+  or an arc, which sweeps through the plane whether or not it says where it
+  ends. Demanding **both** `X` and `Y` reads a bead running along one axis as a
+  travel, and demanding either of them reads an arc that names only `I`/`J` — a
+  full circle — as nothing at all. Whether material actually came out is the
+  caller's own question, since only the caller knows what the extruder has been
+  told since; the same predicate is also what lays out a file that states no
+  layers of its own, and there the two passes have to agree on which bead
+  opened which layer or every per-layer set is consulted for the wrong layer.
+- **A walk that cannot be finished is a REFUSAL, not a short answer.**
+  `footprint::Trace` is what a walk returns, and `Trace::Refused` has to reach
+  the caller. Everything downstream reads a missing cell as "nothing was
+  printed there", so a trace cut short in the middle is a lie no caller can see
+  through — here it is a column capped where it carries on — where a refusal is
+  one every caller can act on. A refusal keeps **only** the two cells the
+  move's ends stand in, because that is where the nozzle demonstrably was and a
+  caller sizing a window off the footprint has to see them; cutting the walk
+  short at `MAX_CELLS` instead left a trail heading off toward a coordinate no
+  printer could reach. `brick` leaves the layers holding such a move unbricked
+  and warns; no printer makes that move, so it is never a hard failure
+  (`brick::tests::a_layer_holding_a_move_that_cannot_be_followed_is_left_unbricked`).
 - **Verify with the physical quantity, not the internal one.** The check that
   matters is "how much solid-infill or top-surface path is laid over a bead
   standing half a layer proud", measured straight off the output file. On the
@@ -479,6 +592,23 @@ Each of these cost a wrong answer or a shipped bug.
   changed position. `TAIL` (64) caps it; the longest real tail before a wall
   measured 33 lines, on a Bambu profile with a timelapse macro. Cost: `brick`
   went 27.6 ms to 28.6 ms on the synthetic bench, 339 to 328 MB/s.
+- **A rewritten line keeps its Marlin checksum true.** The serial dialect ends
+  a line with `*nn`, the XOR of every byte in front of the `*`, and a firmware
+  reading it stops parsing there. So a `Z` word appended behind the `*` is
+  never seen and the raise silently does not happen, while an `E` rescaled in
+  front of it leaves the stated sum stale and the whole line is rejected.
+  `gcode::rewrite` puts new words **before** the `*` and recomputes the sum
+  over the bytes it actually wrote.
+- **A line read in relative or inch mode is written back exactly as found.**
+  `Modal::is_plain` is `G90` and `G21` together, and it is the only state in
+  which a coordinate this tool writes says what it means. A `G91`/`G20` stretch
+  is custom G-code — a colour change, an MMU swap, a timelapse, a layer-change
+  script — and never a perimeter, so nothing is given up by leaving it alone.
+  It is still **measured**, so nothing downstream is misplaced: `Modal::apply`
+  scales by 25.4 under `G20`, accumulates under `G91`, and takes a `G92` as a
+  place however the mode reads a move. Feed it `Line::parse`, not `Line::scan`
+  — `scan` drops `X` and `Y`, and a tracker that never sees them loses the
+  position.
 - **Do not measure the Z feedrate over the whole file.** `Scan` takes the
   slowest Z-only move, which before the `open_layer` gate was the start
   G-code's bed-clearance move on **every one of 28 real slices** — `G1 Z5 F300`
@@ -554,6 +684,18 @@ not "fix" it.
   of its own decoded G-code measures 0.218, which raised by 0.109 instead of
   0.100. `tests/binary_gcode.rs` pins the two paths together by exporting
   `SLIC3R_LAYER_HEIGHT`, which is what a slicer does.
+- **The histogram is the LAST answer, not the first.** A print retracts far
+  more often than it changes layer, so where a Z-hop differs from the layer
+  height the hop wins the vote outright — which is the whole of the 0.218
+  above. `Scan::measured_height` differences each layer's own *floor* instead,
+  and a floor is a per-layer minimum that a hop cannot reach; the histogram
+  stands in only where there are no floors to difference at all, which is a
+  file that lays no bead — a file with no layer markers has floors of its own,
+  from `Markerless`. Do NOT put the histogram back in front: pinned by
+  `scan::a_z_hop_is_not_mistaken_for_the_layer_height`. And whichever answer
+  wins, it goes through `is_a_height` — without that a bed-clearance `G1 Z50`
+  became the layer height and came back out as a commanded raise
+  (`scan::a_measured_step_no_bead_could_be_is_refused`).
 - **The gate is load-bearing.** `Survey::layer_heights` is populated *only*
   when the heights genuinely vary, so a fixed-height file takes the exact code
   path it took before. Fixed-height files measure a spread of 3.6e-15 mm (float
@@ -575,13 +717,28 @@ not "fix" it.
 - **Orca commands Z on `G2`/`G3` arcs** (557 of them on the adaptive Benchy —
   helical lifts). `Scan` ignores arcs for Z, which is right: they are hops. Do
   not "fix" this without re-measuring.
-- **A file with no layer-change marker at all still gets one flat raise.**
-  `Scan` only opens a layer on a marker, so `layer_heights` stays empty and the
-  nominal is used. Verified: the same synthetic slice raises 0.050–0.100 with
-  `;LAYER:n` present and a flat 0.100 with the markers stripped. Left alone on
-  purpose — without a marker a priming lift reads as a layer, so measuring
-  heights there would feed the arithmetic garbage, and falling back is the safe
-  answer. Every mainstream slicer emits one of the three markers.
+- **A file with no layer-change marker at all is laid out, not given up on.**
+  `scan::Markerless` is that layout and **both passes use it**: a layer opens
+  on the first bead laid off the plane the last one sat on. A boundary the
+  survey and the rewrite disagree on is worse than no boundary at all, because
+  every per-layer set is then consulted for the wrong layer, so there is one
+  rule and both call it. It is the Z **move** that cannot be trusted — a hop
+  lifts and comes back down before the next bead, so counting Z moves counted
+  every hop as a layer and walked the rewrite's layer number away from the
+  survey's for the rest of the file. The plane is `Markerless::plane()`,
+  measured at the beads rather than accumulated, because the Z that reaches a
+  layer is commanded while the layer before it is still open; that is also why
+  `Pass::flush_before_a_layer` writes the loops still buffered at the layer
+  that is **ending**, at its plane and metered for its height. Such a file
+  therefore has floors to difference like any other, so `layer_heights`,
+  `uncovered`, `unsupported`, `object_starts` and `object_tops` are all filled
+  in for it and the nominal is no longer a fallback for the whole file. The old
+  note here said the opposite — "`layer_heights` stays empty", "left alone on
+  purpose" — and it was wrong: what reads a priming lift as a layer is the Z
+  move, not the bead. A file that turns out to state its layers after all drops
+  the lot (`Scan::forget_the_markerless_layout`); only a start G-code's purge
+  line can reach that, so there is never more than one layer to drop. `zaa`
+  still needs real markers and warns when it does not have them.
 
 ### G-code parsing
 
@@ -676,8 +833,18 @@ Never ship a change to loop handling without running all of these.
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo run -- --verbose --output /tmp/processed.gcode <real.gcode>
+cargo run -- --bricks --verbose --output /tmp/processed.gcode <real.gcode>
 python3 .github/skills/bricklayers/scripts/audit.py all /tmp/processed.gcode
+```
+
+**Pass the original file too whenever `zaa` also ran over it** — its output
+deliberately no longer sits on one height per layer, so a plane read back out of
+it is not the plane the slicer chose, and `invariant` will report every visible
+wall bead as raised:
+
+```sh
+cargo run -- --bricks --zaa --verbose --output /tmp/both.gcode <real.gcode>
+python3 .github/skills/bricklayers/scripts/audit.py invariant /tmp/both.gcode <real.gcode>
 ```
 
 The audit script checks, on real output:
@@ -694,7 +861,7 @@ Confirm `invariant` still has teeth after touching it:
 
 ```sh
 printf '%s\n' "M83" ";LAYER_CHANGE" "G1 Z0.200 F600" ";TYPE:Perimeter" \
-  "G1 Z0.300 F600 ; bricklayers brick raised" ";TYPE:External perimeter" \
+  "G1 Z0.300 F600 ; corbel brick raised" ";TYPE:External perimeter" \
   "G1 X20 Y0 E0.5" > /tmp/control.gcode
 python3 .github/skills/bricklayers/scripts/audit.py invariant /tmp/control.gcode
 # must report 1 violation and exit 1
@@ -709,10 +876,16 @@ contours are being split that should not be.
 | File | Holds |
 |---|---|
 | `src/brick.rs` | loop buffering, `assign_contours`, `number_loops`, `adjacent`, `extrusion_factor` |
-| `src/scan.rs` | `Survey` — one pre-pass for layer count, heights, feedrate, arc count, transform stamps |
-| `src/feature.rs` | region marker classification for every slicer dialect |
+| `src/brick/tests.rs` | its unit tests, in a sibling file so they do not bury it |
+| `src/scan.rs` | `Survey` — one pre-pass for layer count, heights, feedrate, arc count, transform stamps; and `Markerless`, the layer layout for a file that states none |
+| `src/gcode/feature.rs` | region marker classification for every slicer dialect |
 | `src/slicer.rs` | `SLIC3R_*` settings the slicer exports before running the script |
-| `src/gcode.rs` | byte-scanner line parser, `Code`, `Extruder` |
+| `src/gcode.rs` | byte-scanner line parser, `Code`, `Extruder`, `Modal`, checksum-preserving `rewrite` |
+| `src/geometry.rs` | plane geometry both transforms share, re-exported flat |
+| `src/geometry/footprint.rs` | where a layer's material sits, as grid cells; `Grid` picks how fine they are, and `Trace` says whether a walk could be finished |
+| `src/geometry/inset.rs` | moving a closed loop sideways, toward the material behind it |
+| `src/lib.rs` | `Source` (refuses what does not read as G-code) and `Sink` (exclusive temp file, rename, line endings put back, what a replacement cannot carry over) |
+| `src/zaa.rs`, `src/zaa/` | the other transform — see [../zaa/SKILL.md](../zaa/SKILL.md) |
 
 ## Upstream
 

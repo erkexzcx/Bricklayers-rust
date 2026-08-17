@@ -1,6 +1,6 @@
 ---
 name: diagrams
-description: Generate the README's wall cross-section diagrams from the same bead model the binary uses, and verify they have not drifted from it. Use when a diagram in README.md needs regenerating or restyling, when a constant in src/brick.rs changes and the picture must follow, when adding a new figure about bricking geometry, and before trusting any illustration of layer height, bead width, seam stagger, extrusion flow or the visible wall's inward offset.
+description: Generate the README's cross-section diagrams from the same models the binary uses, and verify they have not drifted from it. Use when a diagram in README.md needs regenerating or restyling, when a constant in src/brick.rs or src/zaa/surface.rs changes and the picture must follow, when adding a new figure about bricking or surface-following geometry, and before trusting any illustration of layer height, bead width, seam stagger, extrusion flow, the visible wall's inward offset, or where a model's surface sits inside a layer.
 ---
 
 # Diagrams
@@ -8,46 +8,66 @@ description: Generate the README's wall cross-section diagrams from the same bea
 The pictures in README.md are **generated from the binary's own arithmetic**, not drawn. A
 figure that disagrees with the code is worse than no figure, because a reader will believe it.
 
+Two figures, one per transform:
+
+| figure | transform | what it argues |
+|---|---|---|
+| `img/interlock-*.png` | BrickLayers | staggering the seams opens the corners up, and the flow is what pays for that and then some |
+| `img/contour-*.png` | Z anti-aliasing | a course laid at one height misses the surface by half a layer; followed, every bead's top lands on it |
+
 Everything lives in [scripts/](./scripts):
 
 | file | |
 |---|---|
 | `beads.py` | the bead model, function for function the twin of `src/brick.rs` |
-| `render.py` | draws the panels and writes the PNGs |
-| `pin.py` | proves `beads.py` still agrees with the Rust **and with the compiled binary** |
+| `surface.py` | the surface model, the twin of `src/zaa/surface.rs` and `src/zaa.rs` |
+| `render.py` | draws the interlock panels and writes its PNGs |
+| `contour.py` | draws the surface panels and writes its PNGs |
+| `pin.py` | proves both models still agree with the Rust **and with the compiled binary** |
 
 ## Regenerating
 
 ```sh
 python3 .github/skills/diagrams/scripts/pin.py       # must pass first
-python3 .github/skills/diagrams/scripts/render.py --output-dir .
+python3 .github/skills/diagrams/scripts/render.py
+python3 .github/skills/diagrams/scripts/contour.py
 ```
 
-`render.py` writes `interlock-light.png` and `interlock-dark.png` into the repo root, which is
-where README.md's `<picture>` block looks for them. Both are committed: GitHub cannot run a
-script, and a diagram that only exists on someone's laptop is a diagram that rots.
+Both write into `img/` at the repo root, which is where README.md's `<picture>` blocks look.
+All four PNGs are committed: GitHub cannot run a script, and a diagram that only exists on
+someone's laptop is a diagram that rots. **A figure carries text, so a rename reaches it** —
+the interlock pair said `what bricklayers does by default` for a while after the binary stopped
+being called that, because nobody re-ran the script. It said `what corbel does by default` for
+a while after that, which was wrong twice over: naming no transform is refused, so nothing is
+done by default. Every panel that a switch produces now names that switch — `what --bricks
+--extra-flow 0 does` on the middle interlock panel, `what --bricks does` on the fed one, `what
+--zaa does` on the followed slope — in the same words, size and ink, from `render.SWITCH_SIZE`,
+which `contour.py` imports so the two figures cannot drift apart. The label lives in the panel's
+own tuple in `render.steps`, not in an index test, so adding a panel cannot mislabel one.
 
 Needs `matplotlib`. Nothing else, and nothing is added to `Cargo.toml` — this is documentation
 tooling, not a dependency of the binary.
 
 ## The rule
 
-**Never hard-code a coordinate.** Every position, height and width in `render.py` comes back
-from `beads.py`, which is the mirror of `brick.rs`. If a picture needs a number, add the
-function that derives it; do not measure it off the last render.
+**Never hard-code a coordinate.** Every position, height and width in `render.py` and
+`contour.py` comes back from `beads.py` or `surface.py`, which are the mirrors of the Rust. If a
+picture needs a number, add the function that derives it; do not measure it off the last render.
 
 `pin.py` enforces this from both ends:
 
-1. It reads the constants straight out of `src/brick.rs` and compares them with `beads.py`.
-   A retuned `DEFAULT_EXTRA_FLOW` or a renamed `REFERENCE_WIDTH` fails here.
-2. It builds the release binary, runs it over a synthetic PrusaSlicer-shaped slice, and checks
-   that the raise heights and the visible wall's offset in the output are the ones `beads.py`
-   predicts. This is what catches a formula that is right in isolation and wrong in place.
+1. It reads the constants straight out of `src/brick.rs`, `src/zaa/surface.rs` and `src/zaa.rs` and
+   compares them with the Python. A retuned `DEFAULT_EXTRA_FLOW`, a renamed `REFERENCE_WIDTH` or
+   a changed `FADE` fails here, as does deleting the line that caps the visible wall.
+2. It builds the release binary and runs it over two synthetic slices — a PrusaSlicer-shaped
+   cube for bricking and a wedge for the surface — and checks that the raise heights, the
+   visible wall's offset and the followed heights in the output are the ones the models predict.
+   This is what catches a formula that is right in isolation and wrong in place.
 
-It **always** rebuilds. A stale `target/release/bricklayers` is exactly the drift the script
+It **always** rebuilds. A stale `target/release/corbel` is exactly the drift the script
 exists to catch, and it would blame the Rust for it.
 
-## What the picture has to get right
+## What the interlock picture has to get right
 
 The figure is three panels, and the order is the argument — including the step where the tool
 makes things *worse*:
@@ -145,19 +165,67 @@ inner one has infill against it rather than another loop.
 The third panel therefore ends **tighter than the first**, which is the only honest way to draw
 a tool whose middle step opens a void up.
 
-## Changing the figure
+## What the contour picture has to get right
 
-`render.py --help` exposes the geometry: `--layers`, `--loops`, `--height`, `--width`,
+Two panels, and the argument is the dashed line that runs through both: **where the model's
+surface really is**. As sliced it cuts straight through each course; followed, every bead's top
+lands on it. Nothing else in the figure has to be believed for that to be visible.
+
+That line is one straight line for the whole slope, and that is not a simplification —
+`surface.surface` derives it. A slicer takes its cross-section through the middle of a layer, so
+a layer's outline is where the surface passes half a layer below that layer's plane.
+Substituting that into `plane_of` and `share` cancels the layer index away. It is also *why*
+consecutive treads join instead of stepping, so drawing the line per-tread would throw away the
+one thing the figure is for.
+
+These are the details a hand-drawn version gets wrong, every one of them derivable:
+
+- **A tread is made of beads, and they do not blend.** At 0.2 mm layers on the shipped 7° slope
+  a tread carries about four of them, so what the transform leaves is a **finer staircase**,
+  with a step of `spacing / strip` — a quarter — of the riser it replaced. Drawing a smooth
+  ramp would claim something the tool does not do. It also says the right thing about the dial:
+  the shallower the slope, the more beads share the tread and the smaller the residual step.
+- **Every bead's bottom is its layer's plane less one layer, flat.** What sits under a strip is
+  covered by the layer above it, so it was laid flat, and *that* is what lets a stretch be
+  metered for `height + rise` and fill exactly. If the picture ever shows a bead sitting on a
+  sloped one, the metering it draws is wrong.
+- **The rise is quantised.** `surface.quantise` puts it on one of `STEPS` steps of a layer,
+  because `Field::rise` is a signed byte. It is a fifth of a micron, invisible, and it is in the
+  model so that nothing else has to be approximate.
+- **The visible wall is only ever lowered.** Its centreline already stands half a bead inside
+  the layer's own face, so on any tread wider than that the surface there is *below* the plane
+  and the cap never binds — which is exactly why the cap costs so little. `surface.WALL_CEILING`
+  is what holds it, and `pin.py` fails if `zaa.rs` stops applying it.
+- **The frame is cut mid-tread at both ends.** On a step it would cut a course where the lattice
+  of beads and the edge of a strip disagree, leaving one bead of the layer below half exposed at
+  the very edge and one of the top course with nothing drawn over it — both read as notches the
+  transform had put there.
+- **A course past the frame is drawn.** Without it the top tread's own covered bead has nothing
+  over it. It costs one loop iteration and removes the last artefact.
+
+The **flat top is not in the picture**, and that is deliberate: it is the case the transform
+declines, so a figure whose top course was flat would be showing the tool doing nothing at the
+very place the eye lands. The slope runs off the top-right corner instead.
+
+## Changing the figures
+
+`render.py --help` exposes the interlock geometry: `--layers`, `--loops`, `--height`, `--width`,
 `--skin-width`, `--extra-flow`, `--capped`. Use them to sanity-check a change — an
 adaptive-height slice, a two-loop wall, a column capped where something is printed over it —
 before settling on what README.md ships. The shipped figure runs uncapped, so every column
 reaches full height and the raised ones stand their half layer proud, which is what a wall
 does where it simply carries on.
 
-Two things to keep if you restyle it:
+`contour.py --help` exposes the slope: `--treads`, `--strip`, `--height`, `--width`, `--skin-width`, `--reach`. `--strip` is the tread width, which is the layer height over the tangent of the slope, so it is the dial that sets how shallow the drawn surface is. **`--reach` is the script's only dial that the binary does not have** — there it is derived per layer, as the tread a `SHALLOWEST_SLOPE` surface leaves, and `surface.reach_for` is that derivation. It is exposed here because the fade is otherwise unreachable in a figure: the amplitude is full while the strip stays under three quarters of the reach, fades over the rest, and is gone once the two are equal — set `--strip 4 --reach 4` and every bead should come back flat. That is a good check that the figure is still reading `surface.py` rather than a remembered number.
 
-- **The red line is the join between two layers**, drawn across the whole wall. It is the plane
-  an FDM part splits along, and its going flat in the first panel and stepped in the other two
-  *is* the argument.
+Three things to keep if you restyle either:
+
+- **The red line.** In the interlock figure it is the join between two layers — the plane an FDM
+  part splits along — and its going flat in the first panel and stepped in the other two *is*
+  the argument. In the contour figure it is the model's surface, and its being cut through in
+  the first panel and ridden in the second is the same kind of argument.
+- **One palette.** `contour.py` imports `Theme`, `LIGHT`, `DARK`, `GAP` and `brick` from
+  `render.py`, so the two figures cannot drift apart in colour or in how a bead is drawn. Blue
+  is the wall you can see and orange is a bead the tool moved, in both.
 - **Both themes.** GitHub serves the dark PNG through `prefers-color-scheme`, and a white slab
   in a dark README looks broken.

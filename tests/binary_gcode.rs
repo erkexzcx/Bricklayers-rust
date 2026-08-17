@@ -9,9 +9,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{env, fs};
 
-use bricklayers::{Source, bgcode};
+use corbel::{Source, bgcode};
 
-const BIN: &str = env!("CARGO_BIN_EXE_bricklayers");
+const BIN: &str = env!("CARGO_BIN_EXE_corbel");
 
 /// PrusaSlicer 2.8.1, one G-code block, heatshrink 12/4 + MeatPack.
 const SINGLE: &[u8] = include_bytes!("fixtures/mini_cube_ps2.8.1.bgcode");
@@ -24,7 +24,7 @@ impl Sandbox {
     fn new(label: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!("bricklayers-{label}-{}-{id}", std::process::id()));
+        let path = env::temp_dir().join(format!("corbel-{label}-{}-{id}", std::process::id()));
         fs::create_dir_all(&path).expect("create sandbox");
         Self(path)
     }
@@ -46,8 +46,14 @@ impl Drop for Sandbox {
     }
 }
 
+/// Runs the binary with both transforms, which is what these pinned before
+/// naming one became mandatory.
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN).args(args).output().expect("run binary")
+    Command::new(BIN)
+        .args(["--bricks", "--zaa"])
+        .args(args)
+        .output()
+        .expect("run binary")
 }
 
 /// Runs the binary with the layer height a slicer would have exported.
@@ -58,6 +64,7 @@ fn run(args: &[&str]) -> std::process::Output {
 /// height out from rather than of what each did with it.
 fn run_at_layer_height(args: &[&str]) -> std::process::Output {
     Command::new(BIN)
+        .args(["--bricks", "--zaa"])
         .args(args)
         .env("SLIC3R_LAYER_HEIGHT", "0.2")
         .output()
@@ -220,7 +227,7 @@ fn brick_rewrites_binary_gcode_in_place() {
     assert!(bgcode::is_binary(&written), "output is no longer binary");
 
     let (_, gcode) = bgcode::parse(&written).expect("output should parse");
-    assert!(gcode.contains("; bricklayers brick raised"), "{gcode}");
+    assert!(gcode.contains("; corbel brick raised"), "{gcode}");
     assert!(gcode.contains(";TYPE:External perimeter\n"), "{gcode}");
 
     assert!(leftovers(&sandbox).is_empty(), "left a temporary behind");
@@ -265,10 +272,7 @@ fn a_rewrite_across_many_blocks_matches_the_text_path() {
     }
 
     let rewritten = streamed(&binary);
-    assert!(
-        rewritten.contains("; bricklayers brick raised"),
-        "no change"
-    );
+    assert!(rewritten.contains("; corbel brick raised"), "no change");
     assert_eq!(
         rewritten,
         fs::read_to_string(&text).expect("read text result")
